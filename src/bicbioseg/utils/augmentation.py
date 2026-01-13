@@ -4,6 +4,9 @@ import numpy as np
 import cv2
 from torchvision import transforms
 from PIL import Image
+import os
+import glob
+from pathlib import Path
 
 class AugmentImages:
     @staticmethod
@@ -13,7 +16,10 @@ class AugmentImages:
              assert mask.dtype == 'uint8', "Mask must be uint8"
 
     @staticmethod
-    def rotate(image: np.ndarray, mask: np.ndarray = None, angle_range=(5, 30), resize_target=None):
+    def rotate(image: np.ndarray, mask: np.ndarray = None, angle_range=(5, 30), resize_target=None, probability=1.0):
+        if random.random() > probability:
+            return image, mask
+            
         AugmentImages._check_type(image, mask)
         
         angle = random.randint(angle_range[0], angle_range[1])
@@ -40,7 +46,10 @@ class AugmentImages:
         return aug_img, aug_mask
 
     @staticmethod
-    def flip(image: np.ndarray, mask: np.ndarray = None, mode='random'):
+    def flip(image: np.ndarray, mask: np.ndarray = None, mode='random', probability=1.0):
+        if random.random() > probability:
+            return image, mask
+            
         AugmentImages._check_type(image, mask)
         
         if mode == 'random':
@@ -60,7 +69,10 @@ class AugmentImages:
         return aug_img, aug_mask
 
     @staticmethod
-    def adjust_brightness(image: np.ndarray, mask: np.ndarray = None, delta_range=(-30, 30)):
+    def adjust_brightness(image: np.ndarray, mask: np.ndarray = None, delta_range=(-30, 30), probability=1.0):
+        if random.random() > probability:
+            return image, mask
+            
         AugmentImages._check_type(image, mask)
         
         delta = random.randint(delta_range[0], delta_range[1])
@@ -70,7 +82,10 @@ class AugmentImages:
         return new_image, mask
 
     @staticmethod
-    def hist_equalize(image: np.ndarray, mask: np.ndarray = None, clipLimit=3, tileGridSize=(8,8)):
+    def hist_equalize(image: np.ndarray, mask: np.ndarray = None, clipLimit=3, tileGridSize=(8,8), probability=1.0):
+        if random.random() > probability:
+            return image, mask
+            
         AugmentImages._check_type(image, mask)
         
         # grayscale -> direct apply, else YCrCb then apply
@@ -86,7 +101,10 @@ class AugmentImages:
         return equalized, mask
 
     @staticmethod
-    def random_crop(image: np.ndarray, mask: np.ndarray = None, crop_size=(224, 224)):
+    def random_crop(image: np.ndarray, mask: np.ndarray = None, crop_size=(224, 224), probability=1.0):
+        if random.random() > probability:
+            return image, mask
+            
         AugmentImages._check_type(image, mask)
         
         h, w = image.shape[:2]
@@ -109,3 +127,107 @@ class AugmentImages:
             mask_crop = mask[top:top+crop_h, left:left+crop_w]
             
         return img_crop, mask_crop
+
+class AugmentationPipeline:
+    def __init__(self, augmentations=None):
+        self.augmentations = augmentations if augmentations is not None else []
+    
+    def __call__(self, image, mask):
+        for aug_func in self.augmentations:
+            image, mask = aug_func(image, mask)
+        return image, mask
+    
+    def add(self, augmentation):
+        self.augmentations.append(augmentation)
+        return self
+    
+
+def _load_file_paths(source, valid_extensions=('.png', '.jpg', '.jpeg', '.bmp')):
+    if isinstance(source, list):
+        return source
+    elif isinstance(source, (str, Path)):
+        if os.path.isdir(source):
+            files = []
+            for ext in valid_extensions:
+                files.extend(glob.glob(os.path.join(source, f"*{ext}")))
+            return sorted(files)
+        else:
+            raise FileNotFoundError(f"Directory not found: {source}")
+    else:
+        raise ValueError("Must be a directory or a list of file paths.")
+
+# save the augmented image to a folder
+def apply_and_save_augmentations(
+    images_source,
+    masks_source=None,
+    output_dir="augmented",
+    augmentations=None,
+    num_augmented=1,
+    valid_extensions=('.png', '.jpg', '.jpeg', '.bmp'),
+    random_seed=None
+    ):
+
+    if random_seed is not None:
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+    
+    if augmentations is None:
+        raise ValueError("At least one augmentation required!")
+    
+    # Load file paths
+    all_images = _load_file_paths(images_source, valid_extensions)
+    all_masks = None
+    
+    if masks_source is not None:
+        all_masks = _load_file_paths(masks_source, valid_extensions)
+        if len(all_images) != len(all_masks):
+            raise ValueError(f"No. Mismatch: {len(all_images)} images vs {len(all_masks)} masks")
+        all_masks.sort()
+    
+    all_images.sort()
+    
+    # make dir
+    img_save_dir = os.path.join(output_dir, 'images')
+    os.makedirs(img_save_dir, exist_ok=True)
+    
+    mask_save_dir = None
+    if all_masks is not None:
+        mask_save_dir = os.path.join(output_dir, 'masks')
+        os.makedirs(mask_save_dir, exist_ok=True)
+    
+    print(f"Processing {len(all_images)} images with {num_augmented} augmented version(s) each...")
+    print(f"Output directory: {os.path.abspath(output_dir)}")
+    
+    # aug pipeline
+    pipeline = AugmentationPipeline(augmentations)
+    
+    # process and save
+    for idx, img_path in enumerate(all_images):
+        base_name = os.path.splitext(os.path.basename(img_path))[0]
+        
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"Warning: Could not read {img_path}. Skipping.")
+            continue
+        
+        mask = None
+        if all_masks is not None:
+            mask = cv2.imread(all_masks[idx], 0)
+            if mask is None:
+                print(f"Warning: Could not read {all_masks[idx]}. Skipping.")
+                continue
+        
+        for aug_num in range(1, num_augmented + 1):
+            aug_img, aug_mask = pipeline(img.copy(), mask.copy() if mask is not None else None)
+            
+            aug_img_name = f"{base_name}_aug{aug_num}.png"
+            cv2.imwrite(os.path.join(img_save_dir, aug_img_name), aug_img)
+            
+            if aug_mask is not None:
+                cv2.imwrite(os.path.join(mask_save_dir, aug_img_name), aug_mask)
+        
+        if (idx + 1) % 10 == 0:
+            print(f"Processed {idx + 1}/{len(all_images)} images...")
+    
+    print(f"\nAugmented images saved to: {os.path.abspath(output_dir)}")
+    print(f"Generated Total Images: {len(all_images) * num_augmented}")
