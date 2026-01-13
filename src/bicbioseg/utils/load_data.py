@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import DataLoader as TorchDataLoader
 from typing import Union, List, Tuple
+import matplotlib.pyplot as plt
 
 class BiosegDataset(TorchDataset):
     def __init__(self, 
@@ -63,7 +64,7 @@ class DataLoader:
 
     @staticmethod
     def load_data(
-        source: Union[str, List, Tuple[np.ndarray, np.ndarray]], 
+        source: Union[str, List, Tuple[np.ndarray, np.ndarray]] = 'train', 
         masks_source: Union[List, np.ndarray] = None,
         image_size=(224, 224),
         batch_size=4,
@@ -147,3 +148,30 @@ class DataLoader:
             num_workers=num_workers,
             **kwargs
         )
+
+    @staticmethod
+    def plot_samples(dataloader, num_samples=2, figsize=(12, 6)):
+        
+        batch = next(iter(dataloader))
+        images, masks = batch
+        
+        num_samples = min(num_samples, len(images))
+        
+        fig, axes = plt.subplots(num_samples, 2, figsize=figsize)
+        if num_samples == 1:
+            axes = axes.reshape(1, -1)
+        
+        for i in range(num_samples):
+            img = images[i].numpy().transpose(1, 2, 0)
+            mask = masks[i].numpy()
+            
+            axes[i, 0].imshow(img)
+            axes[i, 0].set_title(f'Image {i+1}')
+            axes[i, 0].axis('off')
+            
+            axes[i, 1].imshow(mask, cmap='gray')
+            axes[i, 1].set_title(f'Mask {i+1}')
+            axes[i, 1].axis('off')
+        
+        plt.tight_layout()
+        plt.show()
