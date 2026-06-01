@@ -10,6 +10,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader
 
+from .config import SegmenterConfig, TrainingConfig
+from .exceptions import InferenceError, ModelError
 from .models.attention_unet import AttUNet
 from .models.doubleunet import DoubleUNet
 from .models.segformer import Segformer
@@ -18,6 +20,7 @@ from .models.unet import UNet
 from .utils import losses as loss_module
 from .utils.load_data import DataLoader
 from .utils.metrics import dice_score, jac_score, precision, recall
+from .utils.progress import progress_iter
 
 
 class Segmenter:
@@ -69,7 +72,7 @@ class Segmenter:
         self.in_channels = in_channels
         self.model_kwargs = dict(model_kwargs or {})
         self.loss_kwargs = dict(loss_kwargs or {})
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.device = self.resolve_device(device or "auto")
         self.metrics = list(metrics or ["dice", "iou"])
         self.model = self._build_model(self.model_kwargs).to(self.device)
         self.loss_fn = self._build_loss(loss, self.loss_kwargs)
@@ -82,6 +85,44 @@ class Segmenter:
     @classmethod
     def available_losses(cls) -> List[str]:
         return sorted(cls.LOSS_ALIASES.keys())
+
+    @classmethod
+    def from_config(cls, config: SegmenterConfig):
+        return cls(
+            architecture=config.architecture,
+            loss=config.loss,
+            metrics=config.metrics,
+            image_size=config.image_size,
+            num_classes=config.num_classes,
+            in_channels=config.in_channels,
+            device=config.device,
+            model_kwargs=config.model_kwargs,
+            loss_kwargs=config.loss_kwargs,
+        )
+
+    @staticmethod
+    def available_devices() -> List[str]:
+        devices = ["cpu"]
+        if torch.cuda.is_available():
+            devices.append("cuda")
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            devices.append("mps")
+        return devices
+
+    @staticmethod
+    def resolve_device(device: Optional[str] = "auto") -> torch.device:
+        if device in (None, "auto"):
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                return torch.device("mps")
+            return torch.device("cpu")
+
+        if device == "cuda" and not torch.cuda.is_available():
+            raise ModelError("CUDA was requested but is not available.")
+        if device == "mps" and not (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
+            raise ModelError("MPS was requested but is not available.")
+        return torch.device(device)
 
     def _build_model(self, model_kwargs: dict) -> torch.nn.Module:
         if self.architecture == "unet":
@@ -114,7 +155,7 @@ class Segmenter:
             kwargs.update(model_kwargs)
             return Segformer(**kwargs)
 
-        raise ValueError(f"Unknown architecture '{self.architecture}'. Available: {self.available_models()}")
+        raise ModelError(f"Unknown architecture '{self.architecture}'. Available: {self.available_models()}")
 
     def _build_loss(self, loss, loss_kwargs: dict):
         if isinstance(loss, torch.nn.Module):
@@ -126,7 +167,7 @@ class Segmenter:
 
         loss_key = loss.lower()
         if loss_key not in self.LOSS_ALIASES:
-            raise ValueError(f"Unknown loss '{loss}'. Available: {self.available_losses()}")
+            raise ModelError(f"Unknown loss '{loss}'. Available: {self.available_losses()}")
 
         return self.LOSS_ALIASES[loss_key](**loss_kwargs)
 
@@ -142,7 +183,7 @@ class Segmenter:
         if name == "sgd":
             return torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
 
-        raise ValueError("optimizer must be 'adam', 'adamw', 'sgd', or a torch optimizer.")
+        raise ModelError("optimizer must be 'adam', 'adamw', 'sgd', or a torch optimizer.")
 
     def _config(self) -> dict:
         return {
@@ -492,6 +533,15 @@ class Segmenter:
 
         return {name: value / max(1, batches) for name, value in totals.items()}
 
+    def _load_checkpoint_for_resume(self, path: Union[str, os.PathLike], optimizer=None):
+        checkpoint = torch.load(path, map_location=self.device)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        self.model.load_state_dict(state_dict)
+        self.history = checkpoint.get("history", self.history)
+        if optimizer is not None and "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        return checkpoint
+
     def train(
         self,
         data=None,
@@ -512,8 +562,30 @@ class Segmenter:
         patience: int = 10,
         min_delta: float = 0.0,
         monitor_mode: str = "auto",
+        resume_from: Optional[Union[str, os.PathLike]] = None,
+        progress_bar: bool = True,
         verbose: bool = True,
+        config: Optional[TrainingConfig] = None,
     ) -> Dict[str, List[float]]:
+        if config is not None:
+            epochs = config.epochs
+            batch_size = config.batch_size
+            lr = config.lr
+            optimizer = config.optimizer
+            num_workers = config.num_workers
+            save_to = config.save_to if config.save_to is not None else save_to
+            experiment_dir = config.experiment_dir if config.experiment_dir is not None else experiment_dir
+            run_name = config.run_name if config.run_name is not None else run_name
+            save_best = config.save_best
+            monitor = config.monitor
+            early_stopping = config.early_stopping
+            patience = config.patience
+            min_delta = config.min_delta
+            monitor_mode = config.monitor_mode
+            resume_from = config.resume_from if config.resume_from is not None else resume_from
+            progress_bar = config.progress_bar
+            verbose = config.verbose
+
         train_loader, val_loader = self._resolve_loaders(
             data=data,
             train_data=train_data,
@@ -523,7 +595,13 @@ class Segmenter:
             num_workers=num_workers,
         )
         optimizer_obj = self._make_optimizer(optimizer, lr)
-        self.history = {"train_loss": []}
+        if resume_from is not None:
+            self._load_checkpoint_for_resume(resume_from, optimizer=optimizer_obj)
+
+        if resume_from is None or not self.history:
+            self.history = {"train_loss": []}
+        else:
+            self.history.setdefault("train_loss", [])
         run_dir = self._prepare_run_dir(experiment_dir, run_name)
         best_value = None
         stale_epochs = 0
@@ -544,7 +622,8 @@ class Segmenter:
             }
             self._write_json(run_dir / "config.json", config)
 
-        for epoch in range(1, epochs + 1):
+        epoch_iter = progress_iter(range(1, epochs + 1), enabled=progress_bar, desc="Training")
+        for epoch in epoch_iter:
             train_stats = self._run_epoch(train_loader, optimizer=optimizer_obj)
             self.history["train_loss"].append(train_stats["loss"])
             for name, value in train_stats.items():
@@ -575,7 +654,7 @@ class Segmenter:
                     stale_epochs = 0
                     if run_dir is not None and save_best:
                         best_value = current_value
-                        self.save(run_dir / "best_model.pt")
+                        self.save(run_dir / "best_model.pt", optimizer=optimizer_obj)
                 else:
                     stale_epochs += 1
 
@@ -585,10 +664,10 @@ class Segmenter:
                     break
 
         if save_to is not None:
-            self.save(save_to)
+            self.save(save_to, optimizer=optimizer_obj)
 
         if run_dir is not None:
-            self.save(run_dir / "final_model.pt")
+            self.save(run_dir / "final_model.pt", optimizer=optimizer_obj)
             self._write_json(
                 run_dir / "summary.json",
                 {
@@ -601,7 +680,7 @@ class Segmenter:
 
         return self.history
 
-    def save(self, path: Union[str, os.PathLike]) -> str:
+    def save(self, path: Union[str, os.PathLike], optimizer=None) -> str:
         checkpoint = {
             "architecture": self.architecture,
             "loss": self.loss_name,
@@ -614,6 +693,8 @@ class Segmenter:
             "model_state_dict": self.model.state_dict(),
             "history": self.history,
         }
+        if optimizer is not None:
+            checkpoint["optimizer_state_dict"] = optimizer.state_dict()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(checkpoint, path)
@@ -625,6 +706,43 @@ class Segmenter:
         self.model.load_state_dict(state_dict)
         self.history = checkpoint.get("history", self.history)
         return self
+
+    def create_report(
+        self,
+        run_dir: Union[str, os.PathLike],
+        save_to: Optional[Union[str, os.PathLike]] = None,
+    ) -> str:
+        run_path = Path(run_dir)
+        report_path = Path(save_to) if save_to is not None else run_path / "report.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+
+        config_path = run_path / "config.json"
+        summary_path = run_path / "summary.json"
+        history_plot = run_path / "history.png"
+        if self.history and not history_plot.exists():
+            self.plot_history(save_to=history_plot, show=False)
+
+        lines = ["# Segmentation Run Report", ""]
+        if config_path.exists():
+            lines.extend(["## Config", "", "```json", config_path.read_text().strip(), "```", ""])
+        if summary_path.exists():
+            lines.extend(["## Summary", "", "```json", summary_path.read_text().strip(), "```", ""])
+        if history_plot.exists():
+            lines.extend(["## Training Curves", "", f"![Training history]({history_plot.name})", ""])
+
+        prediction_overlays = sorted((run_path / "predictions" / "overlays").glob("*.png"))
+        if prediction_overlays:
+            lines.extend(["## Prediction Overlays", ""])
+            for overlay_path in prediction_overlays[:12]:
+                lines.append(f"![{overlay_path.name}]({overlay_path.relative_to(run_path)})")
+            lines.append("")
+
+        evaluation_summary = run_path / "evaluation" / "evaluation_summary.json"
+        if evaluation_summary.exists():
+            lines.extend(["## Evaluation", "", "```json", evaluation_summary.read_text().strip(), "```", ""])
+
+        report_path.write_text("\n".join(lines))
+        return str(report_path.resolve())
 
     @classmethod
     def load(
@@ -671,7 +789,7 @@ class Segmenter:
         if image_path.is_file():
             return [str(image_path)]
 
-        raise FileNotFoundError(f"Could not find inference image source: {images}")
+            raise InferenceError(f"Could not find inference image source: {images}")
 
     def _predict_array(self, rgb: np.ndarray, threshold: float = 0.5, return_raw: bool = False):
         original_size = (rgb.shape[1], rgb.shape[0])
@@ -711,7 +829,7 @@ class Segmenter:
     def _predict_single_image(self, image_path: Union[str, os.PathLike], threshold: float = 0.5, return_raw=False):
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None:
-            raise ValueError(f"Could not read image: {image_path}")
+            raise InferenceError(f"Could not read image: {image_path}")
 
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         prediction = self._predict_array(rgb, threshold=threshold, return_raw=return_raw)
@@ -759,7 +877,7 @@ class Segmenter:
         predictions = []
 
         with torch.no_grad():
-            for image_path in image_paths:
+            for image_path in progress_iter(image_paths, desc="Inference"):
                 rgb, pred, probability, logits = self._predict_single_image(
                     image_path,
                     threshold=threshold,
@@ -780,6 +898,45 @@ class Segmenter:
                 predictions.append(pred if return_arrays else str(out_path.resolve()))
 
         return predictions
+
+    def predict_one(
+        self,
+        image: Union[str, os.PathLike],
+        threshold: float = 0.5,
+        save_to: Optional[Union[str, os.PathLike]] = None,
+        return_overlay: bool = False,
+        show: bool = False,
+    ):
+        self.model.eval()
+        with torch.no_grad():
+            rgb, pred = self._predict_single_image(image, threshold=threshold)
+
+        overlay = self._overlay_mask_on_image(rgb, pred)
+        if save_to is not None:
+            save_path = Path(save_to)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(save_path), pred)
+            overlay_path = save_path.with_name(f"{save_path.stem}_overlay.png")
+            cv2.imwrite(str(overlay_path), cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+
+        if show:
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+            axes[0].imshow(rgb)
+            axes[0].set_title("Image")
+            axes[1].imshow(pred, cmap="gray", interpolation="nearest")
+            axes[1].set_title("Prediction")
+            axes[2].imshow(overlay)
+            axes[2].set_title("Overlay")
+            for ax in axes:
+                ax.axis("off")
+            fig.tight_layout()
+            plt.show()
+
+        if return_overlay:
+            return pred, overlay
+        return pred
 
     def inference_large_image(
         self,
@@ -819,31 +976,34 @@ class Segmenter:
             x_starts.append(max(0, width - patch_w))
 
         with torch.no_grad():
-            for y in y_starts:
-                for x in x_starts:
-                    patch = rgb[y : y + patch_h, x : x + patch_w]
-                    pad_h = patch_h - patch.shape[0]
-                    pad_w = patch_w - patch.shape[1]
-                    if pad_h or pad_w:
-                        patch = cv2.copyMakeBorder(
-                            patch,
-                            0,
-                            pad_h,
-                            0,
-                            pad_w,
-                            borderType=cv2.BORDER_CONSTANT,
-                            value=0,
-                        )
+            tiles = [(y, x) for y in y_starts for x in x_starts]
+            for y, x in progress_iter(tiles, desc="Tiled inference"):
+                patch = rgb[y : y + patch_h, x : x + patch_w]
+                pad_h = patch_h - patch.shape[0]
+                pad_w = patch_w - patch.shape[1]
+                if pad_h or pad_w:
+                    patch = cv2.copyMakeBorder(
+                        patch,
+                        0,
+                        pad_h,
+                        0,
+                        pad_w,
+                        borderType=cv2.BORDER_CONSTANT,
+                        value=0,
+                    )
 
-                    _, probability, _ = self._predict_array(patch, threshold=threshold, return_raw=True)
-                    probability = probability[..., : patch_h - pad_h, : patch_w - pad_w] if probability.ndim == 3 else probability[: patch_h - pad_h, : patch_w - pad_w]
-                    valid_h, valid_w = probability.shape[-2:]
+                _, probability, _ = self._predict_array(patch, threshold=threshold, return_raw=True)
+                if probability.ndim == 3:
+                    probability = probability[..., : patch_h - pad_h, : patch_w - pad_w]
+                else:
+                    probability = probability[: patch_h - pad_h, : patch_w - pad_w]
+                valid_h, valid_w = probability.shape[-2:]
 
-                    if self.num_classes == 1:
-                        probability_acc[y : y + valid_h, x : x + valid_w] += probability
-                    else:
-                        probability_acc[:, y : y + valid_h, x : x + valid_w] += probability
-                    count_acc[y : y + valid_h, x : x + valid_w] += 1
+                if self.num_classes == 1:
+                    probability_acc[y : y + valid_h, x : x + valid_w] += probability
+                else:
+                    probability_acc[:, y : y + valid_h, x : x + valid_w] += probability
+                count_acc[y : y + valid_h, x : x + valid_w] += 1
 
         count_acc = np.maximum(count_acc, 1)
         if self.num_classes == 1:
@@ -953,6 +1113,83 @@ class Segmenter:
             Segmenter._write_json(output_dir / "evaluation_summary.json", summary)
 
         return summary
+
+    def find_best_threshold(
+        self,
+        images,
+        masks,
+        thresholds: Optional[Sequence[float]] = None,
+        metric: str = "dice",
+        save_to: Optional[Union[str, os.PathLike]] = None,
+    ) -> Dict[str, object]:
+        if self.num_classes != 1:
+            raise ValueError("Threshold tuning is only supported for binary segmentation.")
+
+        thresholds = list(thresholds or np.linspace(0.1, 0.9, 17))
+        image_paths = self._load_inference_images(images)
+        mask_pairs = self._match_prediction_mask_pairs(image_paths, masks)
+        mask_by_stem = {Path(mask).stem.replace("_mask", ""): mask for _, mask in mask_pairs}
+        rows = []
+
+        self.model.eval()
+        with torch.no_grad():
+            probabilities = []
+            ground_truths = []
+            for image_path in progress_iter(image_paths, desc="Threshold tuning"):
+                stem = Path(image_path).stem.replace("_mask", "")
+                if stem not in mask_by_stem:
+                    continue
+                _, _, probability, _ = self._predict_single_image(image_path, return_raw=True)
+                mask = cv2.imread(str(mask_by_stem[stem]), cv2.IMREAD_GRAYSCALE)
+                if mask is None:
+                    continue
+                if probability.shape != mask.shape:
+                    probability = cv2.resize(probability, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_CUBIC)
+                probabilities.append(probability)
+                ground_truths.append((mask > 0).astype(np.float32))
+
+        if not probabilities:
+            raise ValueError("No matched image/mask pairs found for threshold tuning.")
+
+        best_threshold = None
+        best_score = None
+        metric_key = metric.lower()
+        for threshold in thresholds:
+            scores = []
+            for probability, target in zip(probabilities, ground_truths):
+                pred = (probability > threshold).astype(np.float32)
+                pred_tensor = torch.from_numpy(pred)
+                target_tensor = torch.from_numpy(target)
+                if metric_key == "dice":
+                    score = float(dice_score(target_tensor, pred_tensor))
+                elif metric_key in {"iou", "jaccard"}:
+                    score = float(jac_score(target_tensor, pred_tensor))
+                else:
+                    raise ValueError("metric must be 'dice', 'iou', or 'jaccard'.")
+                scores.append(score)
+            mean_score = float(np.mean(scores))
+            rows.append({"threshold": float(threshold), metric_key: mean_score})
+            if best_score is None or mean_score > best_score:
+                best_score = mean_score
+                best_threshold = float(threshold)
+
+        result = {
+            "best_threshold": best_threshold,
+            "best_score": best_score,
+            "metric": metric_key,
+            "rows": rows,
+        }
+
+        if save_to is not None:
+            output_dir = Path(save_to)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with (output_dir / "threshold_tuning.csv").open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["threshold", metric_key])
+                writer.writeheader()
+                writer.writerows(rows)
+            self._write_json(output_dir / "threshold_tuning.json", result)
+
+        return result
 
     def evaluate(
         self,

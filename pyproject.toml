@@ -21,6 +21,7 @@ dependencies = [
     "scipy",
     "torch",
     "torchvision",
+    "tqdm",
 ]
 
 [project.optional-dependencies]

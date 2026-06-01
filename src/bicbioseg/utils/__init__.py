@@ -6,6 +6,7 @@ from .augmentation import (
     create_albumentations_pipeline,
 )
 from .load_data import BiosegDataset, DataLoader
+from .environment import environment_info, set_seed
 
 __all__ = [
     "AugmentImages",
@@ -15,4 +16,6 @@ __all__ = [
     "apply_and_save_augmentations",
     "BiosegDataset",
     "DataLoader",
+    "environment_info",
+    "set_seed",
 ]

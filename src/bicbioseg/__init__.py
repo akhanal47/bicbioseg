@@ -1,16 +1,30 @@
 from .imageops.convert_images import ConvertImage, dicom_to_uint8, tiff_extract_frames
 from .imageops.preprocess import ImageOps, create_dataset_split, create_train_validate_test_split
+from .config import DatasetSplitConfig, ExperimentConfig, SegmenterConfig, TrainingConfig
+from .exceptions import BicBioSegError, DatasetError, InferenceError, ModelError
+from .utils.environment import environment_info, set_seed
 
 
 __all__ = [
     "create_dataset_split",
     "create_train_validate_test_split",
     "ImageOps",
+    "DatasetSplitConfig",
+    "TrainingConfig",
+    "SegmenterConfig",
+    "ExperimentConfig",
+    "BicBioSegError",
+    "DatasetError",
+    "ModelError",
+    "InferenceError",
+    "set_seed",
+    "environment_info",
     "ConvertImage",
     "RemoveNoise",
     "dicom_to_uint8",
     "tiff_extract_frames",
     "Segmenter",
+    "SegmentationExperiment",
     "AugmentImages",
     "AugmentationPipeline",
     "AlbumentationsTransform",
@@ -25,6 +39,11 @@ def __getattr__(name):
         from .trainer import Segmenter
 
         return Segmenter
+
+    if name == "SegmentationExperiment":
+        from .workflow import SegmentationExperiment
+
+        return SegmentationExperiment
 
     if name == "DataLoader":
         from .utils.load_data import DataLoader
