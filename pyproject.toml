@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bicbioseg"
-version = "0.1.0"
+version = "0.1.1"
 description = "User-friendly biomedical image segmentation utilities and training wrappers."
 keywords = ["biomedical", "segmentation", "pytorch", "microscopy", "medical-imaging"]
 readme = "README.md"
