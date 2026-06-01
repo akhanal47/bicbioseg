@@ -6,11 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "bicbioseg"
 version = "0.1.0"
 description = "User-friendly biomedical image segmentation utilities and training wrappers."
+keywords = ["biomedical", "segmentation", "pytorch", "microscopy", "medical-imaging"]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [
-    { name = "bicbioseg contributors" }
+    { name = "Anup Khanal" }
 ]
 dependencies = [
     "matplotlib",
@@ -23,6 +24,11 @@ dependencies = [
     "torchvision",
     "tqdm",
 ]
+
+[project.urls]
+Homepage = "https://github.com/akhanal47/bicbioseg"
+Repository = "https://github.com/akhanal47/bicbioseg"
+Issues = "https://github.com/akhanal47/bicbioseg/issues"
 
 [project.optional-dependencies]
 dicom = ["pydicom"]
