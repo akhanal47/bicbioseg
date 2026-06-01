@@ -1,4 +1,5 @@
 import csv
+import json
 import glob
 import os
 import re
@@ -436,6 +437,123 @@ class ImageOps:
             summary["unmatched"] = ImageOps.find_unmatched_masks(images, masks)
 
         return summary
+
+    @staticmethod
+    def infer_mask_type(
+        masks_source: Source,
+        max_unique_values: int = 256,
+    ) -> Dict[str, object]:
+        mask_paths = _load_file_paths(masks_source)
+        unique_values = set()
+        has_color = False
+        inspected = 0
+
+        for mask_path in mask_paths:
+            mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+            if mask is None:
+                continue
+
+            inspected += 1
+            if mask.ndim == 3 and mask.shape[2] >= 3:
+                colors = np.unique(mask[:, :, :3].reshape(-1, 3), axis=0)
+                non_gray = np.any(colors[:, 0] != colors[:, 1]) or np.any(colors[:, 1] != colors[:, 2])
+                has_color = has_color or bool(non_gray)
+                for color in colors[:max_unique_values]:
+                    unique_values.add(tuple(int(value) for value in color))
+            else:
+                for value in np.unique(mask)[:max_unique_values]:
+                    unique_values.add(int(value))
+
+            if len(unique_values) > max_unique_values:
+                break
+
+        if has_color:
+            mask_type = "color"
+        elif unique_values.issubset({0, 1}) or unique_values.issubset({0, 255}):
+            mask_type = "binary"
+        else:
+            mask_type = "multiclass"
+
+        return {
+            "mask_type": mask_type,
+            "num_masks": len(mask_paths),
+            "num_masks_inspected": inspected,
+            "unique_values": [
+                list(value) if isinstance(value, tuple) else value
+                for value in sorted(unique_values, key=str)[:max_unique_values]
+            ],
+            "truncated_unique_values": len(unique_values) > max_unique_values,
+        }
+
+    @staticmethod
+    def dataset_qc_report(
+        images: Source,
+        masks: Source,
+        save_to: Optional[PathLike] = None,
+    ) -> Dict[str, object]:
+        pairs = _match_image_mask_pairs(images, masks)
+        unmatched = ImageOps.find_unmatched_masks(images, masks)
+        image_shapes: Dict[str, int] = defaultdict(int)
+        mask_shapes: Dict[str, int] = defaultdict(int)
+        mask_values = set()
+        empty_masks = []
+        foreground_percentages = []
+        unreadable_images = []
+        unreadable_masks = []
+
+        for image_path, mask_path in pairs:
+            image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+            mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+
+            if image is None:
+                unreadable_images.append(image_path)
+                continue
+            if mask is None:
+                unreadable_masks.append(mask_path)
+                continue
+
+            image_shapes[str(image.shape)] += 1
+            mask_shapes[str(mask.shape)] += 1
+
+            if mask.ndim == 3:
+                mask_for_stats = cv2.cvtColor(mask[:, :, :3], cv2.COLOR_BGR2GRAY)
+            else:
+                mask_for_stats = mask
+
+            values = np.unique(mask_for_stats)
+            for value in values:
+                mask_values.add(int(value))
+
+            foreground_fraction = float(np.count_nonzero(mask_for_stats) / mask_for_stats.size)
+            foreground_percentages.append(foreground_fraction * 100)
+            if foreground_fraction == 0:
+                empty_masks.append(mask_path)
+
+        report = {
+            "num_pairs": len(pairs),
+            "unmatched": unmatched,
+            "image_shapes": dict(image_shapes),
+            "mask_shapes": dict(mask_shapes),
+            "mask_type": ImageOps.infer_mask_type(masks),
+            "mask_values": sorted(mask_values)[:256],
+            "num_empty_masks": len(empty_masks),
+            "empty_masks": [Path(path).name for path in empty_masks],
+            "foreground_percent": {
+                "mean": float(np.mean(foreground_percentages)) if foreground_percentages else 0.0,
+                "min": float(np.min(foreground_percentages)) if foreground_percentages else 0.0,
+                "max": float(np.max(foreground_percentages)) if foreground_percentages else 0.0,
+            },
+            "unreadable_images": [Path(path).name for path in unreadable_images],
+            "unreadable_masks": [Path(path).name for path in unreadable_masks],
+        }
+
+        if save_to is not None:
+            save_path = Path(save_to)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            with save_path.open("w") as handle:
+                json.dump(report, handle, indent=2)
+
+        return report
 
     @staticmethod
     def resize_dataset(

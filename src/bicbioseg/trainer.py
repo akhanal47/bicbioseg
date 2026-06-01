@@ -1,8 +1,8 @@
 import csv
 import json
 import os
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Union
 
 import cv2
@@ -17,7 +17,7 @@ from .models.transunet import TransUNet
 from .models.unet import UNet
 from .utils import losses as loss_module
 from .utils.load_data import DataLoader
-from .utils.metrics import dice_score, jac_score
+from .utils.metrics import dice_score, jac_score, precision, recall
 
 
 class Segmenter:
@@ -197,6 +197,24 @@ class Segmenter:
             return
         self._write_json(run_dir / "history.json", self.history)
         self._write_history_csv(run_dir / "history.csv", self.history)
+
+    @staticmethod
+    def _monitor_mode(monitor: str, mode: str = "auto") -> str:
+        if mode != "auto":
+            return mode
+        if "loss" in monitor.lower():
+            return "min"
+        return "max"
+
+    @staticmethod
+    def _is_improved(current_value: float, best_value: Optional[float], mode: str, min_delta: float) -> bool:
+        if best_value is None:
+            return True
+        if mode == "min":
+            return current_value < best_value - min_delta
+        if mode == "max":
+            return current_value > best_value + min_delta
+        raise ValueError("mode must be 'auto', 'min', or 'max'.")
 
     @staticmethod
     def _load_history(history_or_path) -> Dict[str, List[float]]:
@@ -490,6 +508,10 @@ class Segmenter:
         run_name: Optional[str] = None,
         save_best: bool = True,
         monitor: str = "val_loss",
+        early_stopping: bool = False,
+        patience: int = 10,
+        min_delta: float = 0.0,
+        monitor_mode: str = "auto",
         verbose: bool = True,
     ) -> Dict[str, List[float]]:
         train_loader, val_loader = self._resolve_loaders(
@@ -504,6 +526,8 @@ class Segmenter:
         self.history = {"train_loss": []}
         run_dir = self._prepare_run_dir(experiment_dir, run_name)
         best_value = None
+        stale_epochs = 0
+        resolved_monitor_mode = self._monitor_mode(monitor, monitor_mode)
 
         if run_dir is not None:
             config = self._config()
@@ -513,6 +537,10 @@ class Segmenter:
                 "lr": lr,
                 "optimizer": optimizer if isinstance(optimizer, str) else optimizer.__class__.__name__,
                 "monitor": monitor,
+                "early_stopping": early_stopping,
+                "patience": patience,
+                "min_delta": min_delta,
+                "monitor_mode": resolved_monitor_mode,
             }
             self._write_json(run_dir / "config.json", config)
 
@@ -538,13 +566,23 @@ class Segmenter:
                 print(message)
 
             self._update_run_artifacts(run_dir)
-            if run_dir is not None and save_best:
-                monitor_values = self.history.get(monitor)
-                if monitor_values:
-                    current_value = monitor_values[-1]
-                    if best_value is None or current_value < best_value:
+            monitor_values = self.history.get(monitor)
+            if monitor_values:
+                current_value = monitor_values[-1]
+                improved = self._is_improved(current_value, best_value, resolved_monitor_mode, min_delta)
+                if improved:
+                    best_value = current_value
+                    stale_epochs = 0
+                    if run_dir is not None and save_best:
                         best_value = current_value
                         self.save(run_dir / "best_model.pt")
+                else:
+                    stale_epochs += 1
+
+                if early_stopping and stale_epochs >= patience:
+                    if verbose:
+                        print(f"Early stopping at epoch {epoch}; {monitor} did not improve for {patience} epoch(s).")
+                    break
 
         if save_to is not None:
             self.save(save_to)
@@ -635,12 +673,8 @@ class Segmenter:
 
         raise FileNotFoundError(f"Could not find inference image source: {images}")
 
-    def _predict_single_image(self, image_path: Union[str, os.PathLike], threshold: float = 0.5):
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError(f"Could not read image: {image_path}")
-
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    def _predict_array(self, rgb: np.ndarray, threshold: float = 0.5, return_raw: bool = False):
+        original_size = (rgb.shape[1], rgb.shape[0])
         resized = cv2.resize(rgb, self.image_size, interpolation=cv2.INTER_CUBIC)
         tensor = resized.astype(np.float32) / 255.0
         tensor = np.transpose(tensor, (2, 0, 1))
@@ -648,12 +682,55 @@ class Segmenter:
 
         output = self.model(tensor)
         if self.num_classes == 1:
-            pred = (torch.sigmoid(output)[0, 0] > threshold).cpu().numpy().astype(np.uint8) * 255
+            logits = output[0, 0].detach().cpu().numpy()
+            probability = torch.sigmoid(output)[0, 0].detach().cpu().numpy()
+            pred = (probability > threshold).astype(np.uint8) * 255
         else:
-            pred = torch.argmax(output, dim=1)[0].cpu().numpy().astype(np.uint8)
+            logits = output[0].detach().cpu().numpy()
+            probability = torch.softmax(output, dim=1)[0].detach().cpu().numpy()
+            pred = np.argmax(probability, axis=0).astype(np.uint8)
 
-        pred = cv2.resize(pred, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
-        return rgb, pred
+        pred = cv2.resize(pred, original_size, interpolation=cv2.INTER_NEAREST)
+        if self.num_classes == 1:
+            probability = cv2.resize(probability, original_size, interpolation=cv2.INTER_CUBIC)
+            logits = cv2.resize(logits, original_size, interpolation=cv2.INTER_CUBIC)
+        else:
+            probability = np.stack(
+                [cv2.resize(channel, original_size, interpolation=cv2.INTER_CUBIC) for channel in probability],
+                axis=0,
+            )
+            logits = np.stack(
+                [cv2.resize(channel, original_size, interpolation=cv2.INTER_CUBIC) for channel in logits],
+                axis=0,
+            )
+
+        if return_raw:
+            return pred, probability, logits
+        return pred
+
+    def _predict_single_image(self, image_path: Union[str, os.PathLike], threshold: float = 0.5, return_raw=False):
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"Could not read image: {image_path}")
+
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        prediction = self._predict_array(rgb, threshold=threshold, return_raw=return_raw)
+        if return_raw:
+            pred, probability, logits = prediction
+            return rgb, pred, probability, logits
+        return rgb, prediction
+
+    @staticmethod
+    def _save_contours(prediction: np.ndarray, path: Path):
+        mask = prediction
+        if mask.ndim == 3:
+            mask = mask[:, :, 0]
+        if mask.max() <= 1:
+            mask = (mask > 0).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        canvas = np.zeros_like(mask, dtype=np.uint8)
+        cv2.drawContours(canvas, contours, -1, 255, 1)
+        cv2.imwrite(str(path), canvas)
 
     def inference(
         self,
@@ -662,6 +739,9 @@ class Segmenter:
         threshold: float = 0.5,
         return_arrays: bool = False,
         save_overlay: bool = False,
+        save_probability: bool = False,
+        save_logits: bool = False,
+        save_contours: bool = False,
     ):
         self.model.eval()
         output_dir = Path(save_to)
@@ -669,21 +749,223 @@ class Segmenter:
         overlay_dir = output_dir / "overlays"
         if save_overlay:
             overlay_dir.mkdir(parents=True, exist_ok=True)
+        if save_probability:
+            (output_dir / "probabilities").mkdir(parents=True, exist_ok=True)
+        if save_logits:
+            (output_dir / "logits").mkdir(parents=True, exist_ok=True)
+        if save_contours:
+            (output_dir / "contours").mkdir(parents=True, exist_ok=True)
         image_paths = self._load_inference_images(images)
         predictions = []
 
         with torch.no_grad():
             for image_path in image_paths:
-                rgb, pred = self._predict_single_image(image_path, threshold=threshold)
+                rgb, pred, probability, logits = self._predict_single_image(
+                    image_path,
+                    threshold=threshold,
+                    return_raw=True,
+                )
                 out_path = output_dir / f"{Path(image_path).stem}_mask.png"
                 cv2.imwrite(str(out_path), pred)
                 if save_overlay:
                     overlay = self._overlay_mask_on_image(rgb, pred)
                     overlay_bgr = cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
                     cv2.imwrite(str(overlay_dir / f"{Path(image_path).stem}_overlay.png"), overlay_bgr)
+                if save_probability:
+                    np.save(output_dir / "probabilities" / f"{Path(image_path).stem}_probability.npy", probability)
+                if save_logits:
+                    np.save(output_dir / "logits" / f"{Path(image_path).stem}_logits.npy", logits)
+                if save_contours:
+                    self._save_contours(pred, output_dir / "contours" / f"{Path(image_path).stem}_contours.png")
                 predictions.append(pred if return_arrays else str(out_path.resolve()))
 
         return predictions
+
+    def inference_large_image(
+        self,
+        image: Union[str, os.PathLike],
+        save_to: Union[str, os.PathLike] = "predictions",
+        patch_size=(512, 512),
+        overlap: int = 64,
+        threshold: float = 0.5,
+        save_overlay: bool = True,
+        save_probability: bool = False,
+    ) -> Dict[str, str]:
+        self.model.eval()
+        image_path = Path(image)
+        raw = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if raw is None:
+            raise ValueError(f"Could not read image: {image}")
+
+        rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+        height, width = rgb.shape[:2]
+        patch_h, patch_w = patch_size
+        stride_h = patch_h - overlap
+        stride_w = patch_w - overlap
+        if stride_h <= 0 or stride_w <= 0:
+            raise ValueError("overlap must be smaller than both patch dimensions.")
+
+        if self.num_classes == 1:
+            probability_acc = np.zeros((height, width), dtype=np.float32)
+        else:
+            probability_acc = np.zeros((self.num_classes, height, width), dtype=np.float32)
+        count_acc = np.zeros((height, width), dtype=np.float32)
+
+        y_starts = list(range(0, max(1, height - patch_h + 1), stride_h))
+        x_starts = list(range(0, max(1, width - patch_w + 1), stride_w))
+        if y_starts[-1] != max(0, height - patch_h):
+            y_starts.append(max(0, height - patch_h))
+        if x_starts[-1] != max(0, width - patch_w):
+            x_starts.append(max(0, width - patch_w))
+
+        with torch.no_grad():
+            for y in y_starts:
+                for x in x_starts:
+                    patch = rgb[y : y + patch_h, x : x + patch_w]
+                    pad_h = patch_h - patch.shape[0]
+                    pad_w = patch_w - patch.shape[1]
+                    if pad_h or pad_w:
+                        patch = cv2.copyMakeBorder(
+                            patch,
+                            0,
+                            pad_h,
+                            0,
+                            pad_w,
+                            borderType=cv2.BORDER_CONSTANT,
+                            value=0,
+                        )
+
+                    _, probability, _ = self._predict_array(patch, threshold=threshold, return_raw=True)
+                    probability = probability[..., : patch_h - pad_h, : patch_w - pad_w] if probability.ndim == 3 else probability[: patch_h - pad_h, : patch_w - pad_w]
+                    valid_h, valid_w = probability.shape[-2:]
+
+                    if self.num_classes == 1:
+                        probability_acc[y : y + valid_h, x : x + valid_w] += probability
+                    else:
+                        probability_acc[:, y : y + valid_h, x : x + valid_w] += probability
+                    count_acc[y : y + valid_h, x : x + valid_w] += 1
+
+        count_acc = np.maximum(count_acc, 1)
+        if self.num_classes == 1:
+            probability = probability_acc / count_acc
+            prediction = (probability > threshold).astype(np.uint8) * 255
+        else:
+            probability = probability_acc / count_acc[None, :, :]
+            prediction = np.argmax(probability, axis=0).astype(np.uint8)
+
+        output_dir = Path(save_to)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mask_path = output_dir / f"{image_path.stem}_mask.png"
+        cv2.imwrite(str(mask_path), prediction)
+
+        outputs = {"mask": str(mask_path.resolve())}
+        if save_probability:
+            probability_path = output_dir / f"{image_path.stem}_probability.npy"
+            np.save(probability_path, probability)
+            outputs["probability"] = str(probability_path.resolve())
+        if save_overlay:
+            overlay = self._overlay_mask_on_image(rgb, prediction)
+            overlay_path = output_dir / f"{image_path.stem}_overlay.png"
+            cv2.imwrite(str(overlay_path), cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+            outputs["overlay"] = str(overlay_path.resolve())
+
+        return outputs
+
+    @staticmethod
+    def _match_prediction_mask_pairs(predictions, masks):
+        prediction_paths = []
+        for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff"):
+            if isinstance(predictions, (str, os.PathLike)) and Path(predictions).is_dir():
+                prediction_paths.extend(Path(predictions).glob(ext))
+        if not prediction_paths:
+            prediction_paths = [Path(path) for path in (predictions if isinstance(predictions, (list, tuple)) else [predictions])]
+
+        mask_paths = []
+        for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff"):
+            if isinstance(masks, (str, os.PathLike)) and Path(masks).is_dir():
+                mask_paths.extend(Path(masks).glob(ext))
+        if not mask_paths:
+            mask_paths = [Path(path) for path in (masks if isinstance(masks, (list, tuple)) else [masks])]
+
+        masks_by_stem = {path.stem.replace("_mask", ""): path for path in mask_paths}
+        pairs = []
+        for pred_path in prediction_paths:
+            stem = pred_path.stem.replace("_mask", "")
+            if stem in masks_by_stem:
+                pairs.append((pred_path, masks_by_stem[stem]))
+        return pairs
+
+    @staticmethod
+    def evaluate_predictions(
+        predictions,
+        masks,
+        metrics: Sequence[str] = ("dice", "iou", "precision", "recall"),
+        save_to: Optional[Union[str, os.PathLike]] = None,
+    ) -> Dict[str, object]:
+        pairs = Segmenter._match_prediction_mask_pairs(predictions, masks)
+        rows = []
+        totals = {metric: [] for metric in metrics}
+
+        for prediction_path, mask_path in pairs:
+            pred_np = cv2.imread(str(prediction_path), cv2.IMREAD_GRAYSCALE)
+            mask_np = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            if pred_np is None or mask_np is None:
+                continue
+            if pred_np.shape != mask_np.shape:
+                pred_np = cv2.resize(pred_np, (mask_np.shape[1], mask_np.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+            pred_tensor = torch.from_numpy((pred_np > 0).astype(np.float32))
+            mask_tensor = torch.from_numpy((mask_np > 0).astype(np.float32))
+            row = {"prediction": Path(prediction_path).name, "mask": Path(mask_path).name}
+
+            for metric in metrics:
+                metric_key = metric.lower()
+                if metric_key == "dice":
+                    value = float(dice_score(mask_tensor, pred_tensor))
+                elif metric_key in {"iou", "jaccard"}:
+                    value = float(jac_score(mask_tensor, pred_tensor))
+                elif metric_key == "precision":
+                    value = float(precision(mask_tensor, pred_tensor))
+                elif metric_key == "recall":
+                    value = float(recall(mask_tensor, pred_tensor))
+                else:
+                    raise ValueError(f"Unsupported metric: {metric}")
+                row[metric_key] = value
+                totals.setdefault(metric_key, []).append(value)
+
+            rows.append(row)
+
+        summary = {
+            "num_samples": len(rows),
+            "mean": {metric: float(np.mean(values)) for metric, values in totals.items() if values},
+            "rows": rows,
+        }
+
+        if save_to is not None:
+            output_dir = Path(save_to)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if rows:
+                fields = sorted({key for row in rows for key in row})
+                with (output_dir / "evaluation.csv").open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(rows)
+            Segmenter._write_json(output_dir / "evaluation_summary.json", summary)
+
+        return summary
+
+    def evaluate(
+        self,
+        images,
+        masks,
+        save_to: Union[str, os.PathLike] = "evaluation",
+        prediction_dir: Optional[Union[str, os.PathLike]] = None,
+        metrics: Sequence[str] = ("dice", "iou", "precision", "recall"),
+        threshold: float = 0.5,
+    ) -> Dict[str, object]:
+        prediction_dir = prediction_dir or Path(save_to) / "predictions"
+        predictions = self.inference(images=images, save_to=prediction_dir, threshold=threshold)
+        return self.evaluate_predictions(predictions, masks, metrics=metrics, save_to=save_to)
 
     def plot_inference_results(
         self,
@@ -814,3 +1096,48 @@ class Segmenter:
             Segmenter._write_json(output_path / "summary.json", {"runs": summary_rows})
 
         return results
+
+    @staticmethod
+    def compare_experiments(
+        experiments_dir: Union[str, os.PathLike],
+        metric: str = "val_loss",
+        save_to: Optional[Union[str, os.PathLike]] = None,
+        show: bool = True,
+        figsize=(8, 5),
+    ):
+        import matplotlib.pyplot as plt
+
+        experiments_path = Path(experiments_dir)
+        rows = []
+        summary_path = experiments_path / "summary.csv"
+        if summary_path.exists():
+            with summary_path.open() as handle:
+                rows = list(csv.DictReader(handle))
+        else:
+            for history_path in experiments_path.glob("*/history.json"):
+                history = Segmenter._load_history(history_path)
+                if metric in history and history[metric]:
+                    rows.append({"run": history_path.parent.name, metric: history[metric][-1]})
+
+        if not rows:
+            raise ValueError(f"No experiment data found in {experiments_dir}.")
+
+        run_names = [row.get("run", f"run_{idx}") for idx, row in enumerate(rows)]
+        values = [float(row[metric]) for row in rows if metric in row and row[metric] != ""]
+        if len(values) != len(run_names):
+            raise ValueError(f"Metric '{metric}' was not found for every experiment.")
+
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.bar(run_names, values)
+        ax.set_ylabel(metric)
+        ax.set_title(f"Experiment Comparison: {metric}")
+        ax.tick_params(axis="x", rotation=45)
+        fig.tight_layout()
+
+        if save_to is not None:
+            save_path = Path(save_to)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, bbox_inches="tight", dpi=150)
+        if show:
+            plt.show()
+        return fig

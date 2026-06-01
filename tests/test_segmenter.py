@@ -86,9 +86,15 @@ def test_segmenter_train_logs_and_loads_checkpoint(tmp_path):
         images=inference_dir,
         save_to=run_dir / "predictions",
         save_overlay=True,
+        save_probability=True,
+        save_logits=True,
+        save_contours=True,
     )
     assert prediction_paths
     assert (run_dir / "predictions" / "overlays" / "cell_overlay.png").exists()
+    assert (run_dir / "predictions" / "probabilities" / "cell_probability.npy").exists()
+    assert (run_dir / "predictions" / "logits" / "cell_logits.npy").exists()
+    assert (run_dir / "predictions" / "contours" / "cell_contours.png").exists()
 
     inference_plot = run_dir / "inference_results.png"
     fig = segmenter.plot_inference_results(
@@ -100,6 +106,29 @@ def test_segmenter_train_logs_and_loads_checkpoint(tmp_path):
     )
     assert fig is not None
     assert inference_plot.exists()
+
+    tiled_outputs = segmenter.inference_large_image(
+        image=image_path,
+        save_to=run_dir / "large_prediction",
+        patch_size=(8, 8),
+        overlap=2,
+        save_probability=True,
+    )
+    assert "mask" in tiled_outputs
+    assert "overlay" in tiled_outputs
+    assert "probability" in tiled_outputs
+
+    mask_dir = tmp_path / "eval_masks"
+    mask_dir.mkdir()
+    cv2.imwrite(str(mask_dir / "cell.png"), masks[0])
+    evaluation = segmenter.evaluate(
+        images=inference_dir,
+        masks=mask_dir,
+        save_to=run_dir / "evaluation",
+    )
+    assert evaluation["num_samples"] == 1
+    assert (run_dir / "evaluation" / "evaluation.csv").exists()
+    assert (run_dir / "evaluation" / "evaluation_summary.json").exists()
 
 
 def test_run_experiment_writes_summary(tmp_path):
@@ -123,3 +152,39 @@ def test_run_experiment_writes_summary(tmp_path):
     assert "unet_dice" in results
     assert (tmp_path / "summary.csv").exists()
     assert (tmp_path / "summary.json").exists()
+
+    comparison_plot = tmp_path / "comparison.png"
+    fig = Segmenter.compare_experiments(
+        tmp_path,
+        metric="train_loss",
+        save_to=comparison_plot,
+        show=False,
+    )
+    assert fig is not None
+    assert comparison_plot.exists()
+
+
+def test_early_stopping(tmp_path):
+    images = np.zeros((2, 16, 16, 3), dtype=np.uint8)
+    masks = np.zeros((2, 16, 16), dtype=np.uint8)
+
+    segmenter = Segmenter(
+        architecture="unet",
+        loss="dice",
+        image_size=(16, 16),
+        device="cpu",
+        model_kwargs={"base_channels": 2, "num_decoder_blocks": 1},
+    )
+
+    history = segmenter.train(
+        data=(images, masks),
+        epochs=3,
+        batch_size=1,
+        num_workers=0,
+        early_stopping=True,
+        patience=0,
+        monitor="train_loss",
+        verbose=False,
+    )
+
+    assert len(history["train_loss"]) <= 3
