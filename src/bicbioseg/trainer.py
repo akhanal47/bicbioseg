@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Union
@@ -700,6 +701,39 @@ class Segmenter:
         torch.save(checkpoint, path)
         return str(path.resolve())
 
+    def summary(self, input_size=None) -> Dict[str, object]:
+        total_params = sum(parameter.numel() for parameter in self.model.parameters())
+        trainable_params = sum(parameter.numel() for parameter in self.model.parameters() if parameter.requires_grad)
+        info = {
+            "architecture": self.architecture,
+            "loss": self.loss_name,
+            "image_size": self.image_size,
+            "num_classes": self.num_classes,
+            "in_channels": self.in_channels,
+            "device": str(self.device),
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params,
+        }
+
+        if hasattr(self.model, "get_architecture_info"):
+            info["architecture_info"] = self.model.get_architecture_info()
+
+        if input_size is not None:
+            if len(input_size) == 2:
+                shape = (1, self.in_channels, input_size[0], input_size[1])
+            elif len(input_size) == 3:
+                shape = (1, input_size[0], input_size[1], input_size[2])
+            else:
+                shape = tuple(input_size)
+            self.model.eval()
+            with torch.no_grad():
+                dummy = torch.zeros(shape, device=self.device)
+                output = self.model(dummy)
+            info["input_shape"] = tuple(shape)
+            info["output_shape"] = tuple(output.shape)
+
+        return info
+
     def load_weights(self, path: Union[str, os.PathLike]):
         checkpoint = torch.load(path, map_location=self.device)
         state_dict = checkpoint.get("model_state_dict", checkpoint)
@@ -776,10 +810,14 @@ class Segmenter:
         return segmenter
 
     def _load_inference_images(self, images) -> List[str]:
-        if isinstance(images, (list, tuple)):
-            return [str(path) for path in images]
+        return self._load_paths_static(images)
 
-        image_path = Path(images)
+    @staticmethod
+    def _load_paths_static(paths_or_dir) -> List[str]:
+        if isinstance(paths_or_dir, (list, tuple)):
+            return [str(path) for path in paths_or_dir]
+
+        image_path = Path(paths_or_dir)
         if image_path.is_dir():
             paths = []
             for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff"):
@@ -789,7 +827,7 @@ class Segmenter:
         if image_path.is_file():
             return [str(image_path)]
 
-            raise InferenceError(f"Could not find inference image source: {images}")
+        raise InferenceError(f"Could not find image source: {paths_or_dir}")
 
     def _predict_array(self, rgb: np.ndarray, threshold: float = 0.5, return_raw: bool = False):
         original_size = (rgb.shape[1], rgb.shape[0])
@@ -938,6 +976,58 @@ class Segmenter:
             return pred, overlay
         return pred
 
+    @staticmethod
+    def ensemble_predict(
+        checkpoints: Sequence[Union[str, os.PathLike]],
+        images,
+        save_to: Union[str, os.PathLike] = "ensemble_predictions",
+        threshold: float = 0.5,
+        device: Optional[str] = None,
+        save_overlay: bool = True,
+    ) -> List[str]:
+        if not checkpoints:
+            raise InferenceError("At least one checkpoint is required for ensemble prediction.")
+
+        models = [Segmenter.load(checkpoint, device=device) for checkpoint in checkpoints]
+        reference = models[0]
+        image_paths = reference._load_inference_images(images)
+        output_dir = Path(save_to)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        overlay_dir = output_dir / "overlays"
+        if save_overlay:
+            overlay_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_paths = []
+        with torch.no_grad():
+            for image_path in progress_iter(image_paths, desc="Ensemble inference"):
+                image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+                if image is None:
+                    continue
+                rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+                probabilities = []
+                for model in models:
+                    _, probability, _ = model._predict_array(rgb, threshold=threshold, return_raw=True)
+                    probabilities.append(probability)
+                mean_probability = np.mean(probabilities, axis=0)
+
+                if reference.num_classes == 1:
+                    prediction = (mean_probability > threshold).astype(np.uint8) * 255
+                else:
+                    prediction = np.argmax(mean_probability, axis=0).astype(np.uint8)
+
+                out_path = output_dir / f"{Path(image_path).stem}_mask.png"
+                cv2.imwrite(str(out_path), prediction)
+                if save_overlay:
+                    overlay = reference._overlay_mask_on_image(rgb, prediction)
+                    cv2.imwrite(
+                        str(overlay_dir / f"{Path(image_path).stem}_overlay.png"),
+                        cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR),
+                    )
+                saved_paths.append(str(out_path.resolve()))
+
+        return saved_paths
+
     def inference_large_image(
         self,
         image: Union[str, os.PathLike],
@@ -1056,42 +1146,99 @@ class Segmenter:
         return pairs
 
     @staticmethod
+    def _binary_metric_value(pred_binary: np.ndarray, mask_binary: np.ndarray, metric: str) -> float:
+        pred_tensor = torch.from_numpy(pred_binary.astype(np.float32))
+        mask_tensor = torch.from_numpy(mask_binary.astype(np.float32))
+        if metric == "dice":
+            return float(dice_score(mask_tensor, pred_tensor))
+        if metric in {"iou", "jaccard"}:
+            return float(jac_score(mask_tensor, pred_tensor))
+        if metric == "precision":
+            return float(precision(mask_tensor, pred_tensor))
+        if metric == "recall":
+            return float(recall(mask_tensor, pred_tensor))
+        raise ValueError(f"Unsupported metric: {metric}")
+
+    @staticmethod
+    def _score_prediction_arrays(
+        pred_np: np.ndarray,
+        mask_np: np.ndarray,
+        metrics: Sequence[str],
+        num_classes: Optional[int] = None,
+        class_names: Optional[Sequence[str]] = None,
+        include_background: bool = False,
+    ) -> Dict[str, float]:
+        pred_np = pred_np.squeeze()
+        mask_np = mask_np.squeeze()
+        if pred_np.shape != mask_np.shape:
+            pred_np = cv2.resize(pred_np, (mask_np.shape[1], mask_np.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        unique_values = set(np.unique(pred_np).tolist()) | set(np.unique(mask_np).tolist())
+        is_binary = unique_values.issubset({0, 1, 255})
+        metric_keys = [metric.lower() for metric in metrics]
+        scores: Dict[str, float] = {}
+
+        if is_binary and (num_classes is None or num_classes <= 2):
+            pred_binary = pred_np > 0
+            mask_binary = mask_np > 0
+            for metric in metric_keys:
+                scores[metric] = Segmenter._binary_metric_value(pred_binary, mask_binary, metric)
+            return scores
+
+        if num_classes is None:
+            num_classes = int(max(np.max(pred_np), np.max(mask_np))) + 1
+
+        class_ids = list(range(num_classes))
+        if not include_background and 0 in class_ids:
+            class_ids.remove(0)
+
+        for class_id in class_ids:
+            class_label = class_names[class_id] if class_names and class_id < len(class_names) else f"class_{class_id}"
+            pred_binary = pred_np == class_id
+            mask_binary = mask_np == class_id
+            for metric in metric_keys:
+                key = f"{metric}_{class_label}"
+                scores[key] = Segmenter._binary_metric_value(pred_binary, mask_binary, metric)
+
+        for metric in metric_keys:
+            values = [value for key, value in scores.items() if key.startswith(f"{metric}_")]
+            if values:
+                scores[f"macro_{metric}"] = float(np.mean(values))
+
+        return scores
+
+    @staticmethod
     def evaluate_predictions(
         predictions,
         masks,
         metrics: Sequence[str] = ("dice", "iou", "precision", "recall"),
         save_to: Optional[Union[str, os.PathLike]] = None,
+        num_classes: Optional[int] = None,
+        class_names: Optional[Sequence[str]] = None,
+        include_background: bool = False,
     ) -> Dict[str, object]:
         pairs = Segmenter._match_prediction_mask_pairs(predictions, masks)
         rows = []
-        totals = {metric: [] for metric in metrics}
+        totals: Dict[str, List[float]] = {}
 
         for prediction_path, mask_path in pairs:
             pred_np = cv2.imread(str(prediction_path), cv2.IMREAD_GRAYSCALE)
             mask_np = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             if pred_np is None or mask_np is None:
                 continue
-            if pred_np.shape != mask_np.shape:
-                pred_np = cv2.resize(pred_np, (mask_np.shape[1], mask_np.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-            pred_tensor = torch.from_numpy((pred_np > 0).astype(np.float32))
-            mask_tensor = torch.from_numpy((mask_np > 0).astype(np.float32))
             row = {"prediction": Path(prediction_path).name, "mask": Path(mask_path).name}
-
-            for metric in metrics:
-                metric_key = metric.lower()
-                if metric_key == "dice":
-                    value = float(dice_score(mask_tensor, pred_tensor))
-                elif metric_key in {"iou", "jaccard"}:
-                    value = float(jac_score(mask_tensor, pred_tensor))
-                elif metric_key == "precision":
-                    value = float(precision(mask_tensor, pred_tensor))
-                elif metric_key == "recall":
-                    value = float(recall(mask_tensor, pred_tensor))
-                else:
-                    raise ValueError(f"Unsupported metric: {metric}")
-                row[metric_key] = value
-                totals.setdefault(metric_key, []).append(value)
+            scores = Segmenter._score_prediction_arrays(
+                pred_np=pred_np,
+                mask_np=mask_np,
+                metrics=metrics,
+                num_classes=num_classes,
+                class_names=class_names,
+                include_background=include_background,
+            )
+            row.update(scores)
+            for key, value in scores.items():
+                totals.setdefault(key, []).append(value)
 
             rows.append(row)
 
@@ -1199,10 +1346,79 @@ class Segmenter:
         prediction_dir: Optional[Union[str, os.PathLike]] = None,
         metrics: Sequence[str] = ("dice", "iou", "precision", "recall"),
         threshold: float = 0.5,
+        num_classes: Optional[int] = None,
+        class_names: Optional[Sequence[str]] = None,
+        include_background: bool = False,
     ) -> Dict[str, object]:
         prediction_dir = prediction_dir or Path(save_to) / "predictions"
         predictions = self.inference(images=images, save_to=prediction_dir, threshold=threshold)
-        return self.evaluate_predictions(predictions, masks, metrics=metrics, save_to=save_to)
+        return self.evaluate_predictions(
+            predictions,
+            masks,
+            metrics=metrics,
+            save_to=save_to,
+            num_classes=num_classes,
+            class_names=class_names,
+            include_background=include_background,
+        )
+
+    @staticmethod
+    def find_worst_predictions(
+        predictions,
+        masks,
+        metric: str = "dice",
+        top_k: int = 10,
+        save_to: Optional[Union[str, os.PathLike]] = None,
+        images=None,
+        num_classes: Optional[int] = None,
+        class_names: Optional[Sequence[str]] = None,
+        include_background: bool = False,
+    ) -> List[Dict[str, object]]:
+        evaluation = Segmenter.evaluate_predictions(
+            predictions=predictions,
+            masks=masks,
+            metrics=(metric,),
+            num_classes=num_classes,
+            class_names=class_names,
+            include_background=include_background,
+        )
+        rows = evaluation["rows"]
+        metric_key = metric.lower()
+        if rows and metric_key not in rows[0]:
+            metric_candidates = [key for key in rows[0] if key == f"macro_{metric_key}" or key.startswith(f"{metric_key}_")]
+            metric_key = f"macro_{metric_key}" if f"macro_{metric_key}" in metric_candidates else metric_candidates[0]
+
+        worst = sorted(rows, key=lambda row: row.get(metric_key, float("inf")))[:top_k]
+
+        if save_to is not None:
+            output_dir = Path(save_to)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if worst:
+                with (output_dir / "worst_predictions.csv").open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=sorted({key for row in worst for key in row}))
+                    writer.writeheader()
+                    writer.writerows(worst)
+
+            prediction_pairs = Segmenter._match_prediction_mask_pairs(predictions, masks)
+            pred_by_name = {Path(pred).name: Path(pred) for pred, _ in prediction_pairs}
+            mask_by_name = {Path(mask).name: Path(mask) for _, mask in prediction_pairs}
+            image_by_stem = {}
+            if images is not None:
+                image_paths = Segmenter._load_paths_static(images)
+                image_by_stem = {Path(path).stem: Path(path) for path in image_paths}
+
+            for rank, row in enumerate(worst, start=1):
+                case_dir = output_dir / f"rank_{rank}_{Path(row['prediction']).stem}"
+                case_dir.mkdir(parents=True, exist_ok=True)
+                if row["prediction"] in pred_by_name:
+                    shutil.copy2(pred_by_name[row["prediction"]], case_dir / row["prediction"])
+                if row["mask"] in mask_by_name:
+                    shutil.copy2(mask_by_name[row["mask"]], case_dir / row["mask"])
+                stem = Path(row["prediction"]).stem.replace("_mask", "")
+                if stem in image_by_stem:
+                    shutil.copy2(image_by_stem[stem], case_dir / image_by_stem[stem].name)
+
+        return worst
 
     def plot_inference_results(
         self,

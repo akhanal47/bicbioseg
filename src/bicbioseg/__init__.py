@@ -1,5 +1,5 @@
 from .imageops.convert_images import ConvertImage, dicom_to_uint8, tiff_extract_frames
-from .imageops.preprocess import ImageOps, create_dataset_split, create_train_validate_test_split
+from .imageops.preprocess import ImageOps, create_dataset_split, create_kfold_splits, create_train_validate_test_split
 from .config import DatasetSplitConfig, ExperimentConfig, SegmenterConfig, TrainingConfig
 from .exceptions import BicBioSegError, DatasetError, InferenceError, ModelError
 from .utils.environment import environment_info, set_seed
@@ -7,6 +7,7 @@ from .utils.environment import environment_info, set_seed
 
 __all__ = [
     "create_dataset_split",
+    "create_kfold_splits",
     "create_train_validate_test_split",
     "ImageOps",
     "DatasetSplitConfig",

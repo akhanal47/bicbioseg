@@ -786,6 +786,10 @@ class ImageOps:
     def prepare_dataset(*args, **kwargs) -> str:
         return create_dataset_split(*args, **kwargs)
 
+    @staticmethod
+    def create_kfold_splits(*args, **kwargs) -> List[str]:
+        return create_kfold_splits(*args, **kwargs)
+
 
 def _save_pair(
     image_path: str,
@@ -892,6 +896,66 @@ def create_dataset_split(
     print(f"Dataset created at: {output_path.resolve()}")
     print(f"Saved files: {counts}")
     return str(output_path.resolve())
+
+
+def create_kfold_splits(
+    images: Source,
+    masks: Source,
+    save_to: PathLike = "dataset_kfold",
+    k: int = 5,
+    resize: Optional[Tuple[int, int]] = None,
+    create_patches: bool = False,
+    patch_size: Tuple[int, int] = (224, 224),
+    balance_empty_masks: bool = False,
+    group_by: Optional[Union[str, Callable[[str], str]]] = "filename",
+    random_seed: int = 42,
+    overwrite: bool = False,
+    progress: bool = True,
+) -> List[str]:
+    """Create K train/validate folds while keeping grouped images together."""
+    if k < 2:
+        raise DatasetError("k must be at least 2 for K-fold splitting.")
+
+    pairs = _match_image_mask_pairs(images, masks)
+    grouped: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+    for image_path, mask_path in pairs:
+        grouped[_group_key(image_path, group_by)].append((image_path, mask_path))
+
+    groups = list(grouped)
+    if k > len(groups):
+        raise DatasetError(f"k={k} is larger than the number of groups ({len(groups)}).")
+
+    rng = np.random.default_rng(random_seed)
+    groups = list(rng.permutation(groups))
+    folds = np.array_split(groups, k)
+    output_path = _prepare_output_dir(save_to, overwrite)
+    created_folds = []
+
+    for fold_idx, val_groups_array in enumerate(folds, start=1):
+        val_groups = set(val_groups_array.tolist())
+        train_items = [pair for group in groups if group not in val_groups for pair in grouped[group]]
+        val_items = [pair for group in groups if group in val_groups for pair in grouped[group]]
+        fold_path = output_path / f"fold_{fold_idx}"
+        created_folds.append(str(fold_path.resolve()))
+
+        for split_name, split_items in {"train": train_items, "validate": val_items}.items():
+            img_save_dir = fold_path / split_name / "images"
+            mask_save_dir = fold_path / split_name / "masks"
+            img_save_dir.mkdir(parents=True, exist_ok=True)
+            mask_save_dir.mkdir(parents=True, exist_ok=True)
+            for image_path, mask_path in progress_iter(split_items, enabled=progress, desc=f"Fold {fold_idx} {split_name}"):
+                _save_pair(
+                    image_path=image_path,
+                    mask_path=mask_path,
+                    img_save_dir=img_save_dir,
+                    mask_save_dir=mask_save_dir,
+                    resize=resize,
+                    create_patches=create_patches,
+                    patch_size=patch_size,
+                    balance_empty_masks=balance_empty_masks,
+                )
+
+    return created_folds
 
 
 def create_train_validate_test_split(

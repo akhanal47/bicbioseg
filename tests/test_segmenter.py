@@ -70,6 +70,10 @@ def test_segmenter_train_logs_and_loads_checkpoint(tmp_path):
     assert restored.architecture == "unet"
     assert restored.history["train_loss"]
 
+    summary = restored.summary(input_size=(16, 16))
+    assert summary["total_parameters"] > 0
+    assert summary["output_shape"][1] == 1
+
     resumed_history = segmenter.train(
         data=(images, masks),
         epochs=1,
@@ -127,6 +131,15 @@ def test_segmenter_train_logs_and_loads_checkpoint(tmp_path):
     assert (run_dir / "predictions" / "logits" / "cell_logits.npy").exists()
     assert (run_dir / "predictions" / "contours" / "cell_contours.png").exists()
 
+    ensemble_paths = Segmenter.ensemble_predict(
+        checkpoints=[run_dir / "final_model.pt", run_dir / "final_model.pt"],
+        images=inference_dir,
+        save_to=run_dir / "ensemble",
+        device="cpu",
+    )
+    assert ensemble_paths
+    assert (run_dir / "ensemble" / "overlays" / "cell_overlay.png").exists()
+
     one_mask, one_overlay = segmenter.predict_one(
         image_path,
         save_to=run_dir / "one_prediction.png",
@@ -181,6 +194,54 @@ def test_segmenter_train_logs_and_loads_checkpoint(tmp_path):
 
     report_path = segmenter.create_report(run_dir)
     assert report_path.endswith("report.md")
+
+
+def test_multiclass_evaluation_and_worst_predictions(tmp_path):
+    pred_dir = tmp_path / "predictions"
+    mask_dir = tmp_path / "masks"
+    image_dir = tmp_path / "images"
+    pred_dir.mkdir()
+    mask_dir.mkdir()
+    image_dir.mkdir()
+
+    good_pred = np.zeros((8, 8), dtype=np.uint8)
+    good_mask = np.zeros((8, 8), dtype=np.uint8)
+    good_pred[1:4, 1:4] = 1
+    good_mask[1:4, 1:4] = 1
+    good_pred[4:7, 4:7] = 2
+    good_mask[4:7, 4:7] = 2
+
+    bad_pred = np.zeros((8, 8), dtype=np.uint8)
+    bad_mask = good_mask.copy()
+
+    cv2.imwrite(str(pred_dir / "good_mask.png"), good_pred)
+    cv2.imwrite(str(mask_dir / "good.png"), good_mask)
+    cv2.imwrite(str(pred_dir / "bad_mask.png"), bad_pred)
+    cv2.imwrite(str(mask_dir / "bad.png"), bad_mask)
+    cv2.imwrite(str(image_dir / "bad.png"), np.zeros((8, 8, 3), dtype=np.uint8))
+
+    evaluation = Segmenter.evaluate_predictions(
+        predictions=pred_dir,
+        masks=mask_dir,
+        metrics=["dice", "iou"],
+        num_classes=3,
+        class_names=["background", "cell", "nucleus"],
+    )
+    assert "macro_dice" in evaluation["mean"]
+    assert "dice_cell" in evaluation["rows"][0]
+
+    worst = Segmenter.find_worst_predictions(
+        predictions=pred_dir,
+        masks=mask_dir,
+        metric="dice",
+        top_k=1,
+        images=image_dir,
+        num_classes=3,
+        class_names=["background", "cell", "nucleus"],
+        save_to=tmp_path / "worst",
+    )
+    assert worst[0]["prediction"] == "bad_mask.png"
+    assert (tmp_path / "worst" / "worst_predictions.csv").exists()
 
 
 def test_run_experiment_writes_summary(tmp_path):
