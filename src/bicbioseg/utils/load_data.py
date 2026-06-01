@@ -6,7 +6,6 @@ import torch
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import DataLoader as TorchDataLoader
 from typing import Union, List, Tuple
-import matplotlib.pyplot as plt
 
 class BiosegDataset(TorchDataset):
     def __init__(self, 
@@ -33,11 +32,11 @@ class BiosegDataset(TorchDataset):
             mask_path = str(self.masks[idx])
             
             image = cv2.imread(img_path, 1) 
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             mask = cv2.imread(mask_path, 0) 
             
             if image is None: raise ValueError(f"Image not found: {img_path}")
             if mask is None: raise ValueError(f"Mask not found: {mask_path}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         else:
             image = self.images[idx]
             mask = self.masks[idx]
@@ -70,12 +69,16 @@ class DataLoader:
         batch_size=4,
         transforms=None,
         num_workers=2,
+        shuffle=True,
         **kwargs
     ):
       
         images_data = None
         masks_data = None
         
+        if isinstance(source, tuple) and len(source) == 2:
+            source, masks_source = source
+
         # from dirs
         if isinstance(source, str) and os.path.isdir(source):
             print(f"Loading from Directory: {source}")
@@ -144,13 +147,14 @@ class DataLoader:
         return TorchDataLoader(
             dataset, 
             batch_size=batch_size, 
-            shuffle=True, 
+            shuffle=shuffle, 
             num_workers=num_workers,
             **kwargs
         )
 
     @staticmethod
     def plot_samples(dataloader, num_samples=2, figsize=(12, 6)):
+        import matplotlib.pyplot as plt
         
         batch = next(iter(dataloader))
         images, masks = batch
