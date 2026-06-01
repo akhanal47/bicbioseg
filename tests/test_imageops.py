@@ -5,7 +5,7 @@ import pytest
 
 cv2 = pytest.importorskip("cv2")
 
-from bicbioseg import DatasetSplitConfig, ImageOps, create_dataset_split
+from bicbioseg import DatasetSplitConfig, ImageOps, create_dataset_split, create_kfold_splits
 
 
 def _write_pair(image_dir: Path, mask_dir: Path, stem: str, image_ext: str = ".jpg"):
@@ -74,6 +74,31 @@ def test_patch_split_does_not_leak_source_images_across_splits(tmp_path):
             source_stem = patch_path.stem.split("_p")[0]
             assert source_stem not in source_to_split or source_to_split[source_stem] == split_name
             source_to_split[source_stem] = split_name
+
+
+def test_create_kfold_splits(tmp_path):
+    image_dir = tmp_path / "images"
+    mask_dir = tmp_path / "masks"
+    image_dir.mkdir()
+    mask_dir.mkdir()
+
+    for idx in range(6):
+        _write_pair(image_dir, mask_dir, f"fold_{idx}", image_ext=".png")
+
+    folds = create_kfold_splits(
+        images=image_dir,
+        masks=mask_dir,
+        save_to=tmp_path / "kfold",
+        k=3,
+        overwrite=True,
+        progress=False,
+    )
+
+    assert len(folds) == 3
+    for fold_path in folds:
+        fold_path = Path(fold_path)
+        assert (fold_path / "train" / "images").exists()
+        assert (fold_path / "validate" / "masks").exists()
 
 
 def test_create_and_reconstruct_patches_round_trip_shape():
