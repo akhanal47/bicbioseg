@@ -1,4 +1,8 @@
 .DS*
+.pytest_cache/
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
