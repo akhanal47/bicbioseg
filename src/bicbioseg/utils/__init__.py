@@ -1,9 +1,17 @@
-from .augmentation import AugmentImages, AugmentationPipeline, apply_and_save_augmentations
+from .augmentation import (
+    AlbumentationsTransform,
+    AugmentImages,
+    AugmentationPipeline,
+    apply_and_save_augmentations,
+    create_albumentations_pipeline,
+)
 from .load_data import BiosegDataset, DataLoader
 
 __all__ = [
     "AugmentImages",
     "AugmentationPipeline",
+    "AlbumentationsTransform",
+    "create_albumentations_pipeline",
     "apply_and_save_augmentations",
     "BiosegDataset",
     "DataLoader",

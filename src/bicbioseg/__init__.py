@@ -13,6 +13,8 @@ __all__ = [
     "Segmenter",
     "AugmentImages",
     "AugmentationPipeline",
+    "AlbumentationsTransform",
+    "create_albumentations_pipeline",
     "apply_and_save_augmentations",
     "DataLoader",
 ]
@@ -34,12 +36,26 @@ def __getattr__(name):
 
         return RemoveNoise
 
-    if name in {"AugmentImages", "AugmentationPipeline", "apply_and_save_augmentations"}:
-        from .utils.augmentation import AugmentImages, AugmentationPipeline, apply_and_save_augmentations
+    if name in {
+        "AugmentImages",
+        "AugmentationPipeline",
+        "AlbumentationsTransform",
+        "create_albumentations_pipeline",
+        "apply_and_save_augmentations",
+    }:
+        from .utils.augmentation import (
+            AlbumentationsTransform,
+            AugmentImages,
+            AugmentationPipeline,
+            apply_and_save_augmentations,
+            create_albumentations_pipeline,
+        )
 
         lazy_exports = {
             "AugmentImages": AugmentImages,
             "AugmentationPipeline": AugmentationPipeline,
+            "AlbumentationsTransform": AlbumentationsTransform,
+            "create_albumentations_pipeline": create_albumentations_pipeline,
             "apply_and_save_augmentations": apply_and_save_augmentations,
         }
         return lazy_exports[name]

@@ -140,6 +140,47 @@ class AugmentationPipeline:
     def add(self, augmentation):
         self.augmentations.append(augmentation)
         return self
+
+
+class AlbumentationsTransform:
+    def __init__(self, transform):
+        self.transform = transform
+
+    def __call__(self, image, mask):
+        augmented = self.transform(image=image, mask=mask)
+        return augmented["image"], augmented["mask"]
+
+
+def create_albumentations_pipeline(
+    transforms=None,
+    horizontal_flip=True,
+    vertical_flip=False,
+    rotate_limit=30,
+    brightness_contrast=True,
+    elastic=False,
+    probability=0.5,
+):
+    try:
+        import albumentations as A
+    except ImportError as exc:
+        raise ImportError(
+            "albumentations is required for this pipeline. Install it with `pip install albumentations`."
+        ) from exc
+
+    if transforms is None:
+        transforms = []
+        if horizontal_flip:
+            transforms.append(A.HorizontalFlip(p=probability))
+        if vertical_flip:
+            transforms.append(A.VerticalFlip(p=probability))
+        if rotate_limit:
+            transforms.append(A.Rotate(limit=rotate_limit, border_mode=cv2.BORDER_CONSTANT, p=probability))
+        if brightness_contrast:
+            transforms.append(A.RandomBrightnessContrast(p=probability))
+        if elastic:
+            transforms.append(A.ElasticTransform(p=probability))
+
+    return AlbumentationsTransform(A.Compose(transforms))
     
 
 def _load_file_paths(source, valid_extensions=('.png', '.jpg', '.jpeg', '.bmp')):

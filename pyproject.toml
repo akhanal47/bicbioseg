@@ -26,6 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 dicom = ["pydicom"]
 dev = ["pytest"]
+albumentations = ["albumentations"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

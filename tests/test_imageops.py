@@ -98,3 +98,23 @@ def test_normalize_binary_and_color_masks():
     assert labels[0, 0] == 0
     assert labels[0, 1] != labels[1, 0]
     assert color_map[(0, 0, 0)] == 0
+
+
+def test_dataset_qc_report_and_mask_type(tmp_path):
+    image_dir = tmp_path / "images"
+    mask_dir = tmp_path / "masks"
+    image_dir.mkdir()
+    mask_dir.mkdir()
+
+    _write_pair(image_dir, mask_dir, "sample_0", image_ext=".png")
+    _write_pair(image_dir, mask_dir, "sample_1", image_ext=".png")
+
+    report_path = tmp_path / "qc.json"
+    report = ImageOps.dataset_qc_report(image_dir, mask_dir, save_to=report_path)
+    mask_type = ImageOps.infer_mask_type(mask_dir)
+
+    assert report["num_pairs"] == 2
+    assert report["num_empty_masks"] == 0
+    assert report["foreground_percent"]["mean"] > 0
+    assert report_path.exists()
+    assert mask_type["mask_type"] == "binary"
