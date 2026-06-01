@@ -1,6 +1,59 @@
 # bicbioseg
 
-`bicbioseg` is a biomedical image segmentation toolkit focused on simple, experiment-friendly Python APIs for preparing data, training common segmentation models, running inference, and comparing results.
+`bicbioseg` is a biomedical image segmentation toolkit for preparing image datasets, training common segmentation models, running inference, and comparing experiments with a simple Python API.
+
+## Status
+
+This project is in early release & active developemnt. APIs may evolve or changes with each releases as more biomedical workflows are added.
+
+## Installation
+
+```bash
+pip install bicbioseg
+```
+
+## What The Package Provides
+
+- Dataset splitting into `train`, `validate`, and `test`
+- K-fold dataset splitting
+- Image/mask filename matching
+- Resize-based dataset preparation
+- Optional patch creation after splitting
+- TIFF frame extraction
+- DICOM to 8-bit image conversion
+- Mask normalization and color-mask-to-label conversion
+- Dataset QC reports and preview plots
+- Common mask postprocessing helpers
+- Object measurements from masks
+- PyTorch dataset/dataloader utilities
+- High-level `Segmenter` wrapper for training/inference
+- Experiment logging to JSON/CSV/checkpoints
+- Training and inference visualizations
+- Early stopping and checkpoint resume
+- Binary and multi-class evaluation
+- Worst-prediction/failure mining
+- Binary threshold tuning
+- Large-image tiled inference
+- Ensemble inference from checkpoints
+- Experiment comparison plots
+- Config dataclasses for reproducible runs
+- Reproducibility and environment helpers
+
+## Expected Dataset Layout
+
+Most high-level APIs expect image and mask folders with matching filename stems:
+
+```text
+raw/
+  images/
+    sample_001.png
+    sample_002.png
+  masks/
+    sample_001.png
+    sample_002.png
+```
+
+Image and mask extensions may differ (same extensions recommended), but stems should match.
 
 ## Quick Start
 
@@ -18,7 +71,7 @@ exp = SegmentationExperiment(
     image_size=(224, 224),
 )
 
-exp.prepare(split=(0.8, 0.1, 0.1), create_patches=True, patch_size=(224, 224))
+exp.prepare(split=(0.8, 0.1, 0.1), resize=(224, 224))
 exp.qc()
 exp.preview(show=True)
 exp.train(epochs=50, batch_size=8, early_stopping=True, patience=10)
@@ -44,17 +97,19 @@ create_dataset_split(
 )
 ```
 
-Create patches after splitting, preventing patches from the same source image from leaking across splits:
+The output structure is:
 
-```python
-create_dataset_split(
-    images="raw/images",
-    masks="raw/masks",
-    save_to="cell_dataset_patches",
-    create_patches=True,
-    patch_size=(224, 224),
-    balance_empty_masks=True,
-)
+```text
+cell_dataset/
+  train/
+    images/
+    masks/
+  validate/
+    images/
+    masks/
+  test/
+    images/
+    masks/
 ```
 
 Create K-fold train/validate splits:
@@ -70,21 +125,35 @@ folds = create_kfold_splits(
 )
 ```
 
-Config objects are also supported:
+Optional patch creation is available for advanced workflows. Patches are created only when explicitly requested, and splitting happens before patching to avoid leakage:
+
+```python
+create_dataset_split(
+    images="raw/images",
+    masks="raw/masks",
+    save_to="cell_dataset_patches",
+    create_patches=True,
+    patch_size=(224, 224),
+    balance_empty_masks=True,
+)
+```
+
+Config objects are supported:
 
 ```python
 from bicbioseg import DatasetSplitConfig, create_dataset_split
 
 config = DatasetSplitConfig(
     split=(0.8, 0.1, 0.1),
-    create_patches=True,
-    patch_size=(224, 224),
+    resize=(512, 512),
 )
 
 create_dataset_split("raw/images", "raw/masks", save_to="dataset", config=config)
 ```
 
 ## QC And Image Operations
+
+Create a QC report:
 
 ```python
 from bicbioseg import ImageOps
@@ -95,28 +164,59 @@ report = ImageOps.dataset_qc_report(
     save_to="qc/qc_report.json",
 )
 
+print(report["warnings"])
+```
+
+Preview image/mask/overlay samples:
+
+```python
 ImageOps.preview_dataset(
     images="raw/images",
     masks="raw/masks",
     num_samples=8,
     save_to="qc/preview.png",
 )
+```
 
+Inspect and validate dataset files:
+
+```python
+summary = ImageOps.inspect_dataset("raw/images", "raw/masks")
 mask_type = ImageOps.infer_mask_type("raw/masks")
 unmatched = ImageOps.find_unmatched_masks("raw/images", "raw/masks")
 ```
 
-Useful preprocessing helpers:
+Resize and normalize masks:
 
 ```python
-ImageOps.resize_dataset("raw/images", "raw/masks", output_dir="resized", image_size=(512, 512))
-ImageOps.normalize_masks("raw/masks", output_dir="normalized_masks", mode="binary")
+ImageOps.resize_dataset(
+    images_source="raw/images",
+    masks_source="raw/masks",
+    output_dir="resized",
+    image_size=(512, 512),
+)
 
-frames, metadata = ImageOps.extract_tiff_frames("stack.tif", get_metadata=True)
-ImageOps.convert_dicom("scan.dcm", output_path="scan.png", method="clip")
+ImageOps.normalize_masks(
+    masks_source="raw/masks",
+    output_dir="normalized_masks",
+    mode="binary",
+)
 ```
 
-Postprocess and measure predictions:
+TIFF and DICOM helpers:
+
+```python
+frames, metadata = ImageOps.extract_tiff_frames("stack.tif", get_metadata=True)
+
+ImageOps.convert_dicom(
+    "scan.dcm",
+    output_path="scan.png",
+    method="clip",
+    clip_percentiles=(1, 99),
+)
+```
+
+Postprocess and measure masks:
 
 ```python
 mask = ImageOps.remove_small_objects(mask, min_size=64)
@@ -156,7 +256,7 @@ history = model.train(
 )
 ```
 
-Training writes run artifacts when `experiment_dir` is provided:
+When `experiment_dir` is provided, training writes:
 
 ```text
 experiments/unet_dice/
@@ -168,14 +268,18 @@ experiments/unet_dice/
   final_model.pt
 ```
 
-Plot curves and sample pairs:
+Plot training curves and samples:
 
 ```python
 model.plot_history(save_to="experiments/unet_dice/history.png")
-model.plot_training_samples(data="cell_dataset", save_to="experiments/unet_dice/training_samples.png")
+
+model.plot_training_samples(
+    data="cell_dataset",
+    save_to="experiments/unet_dice/training_samples.png",
+)
 ```
 
-Resume training:
+Resume from a checkpoint:
 
 ```python
 model.train(
@@ -185,12 +289,45 @@ model.train(
 )
 ```
 
-## Inference
+Use config objects:
 
 ```python
-model = Segmenter.load("experiments/unet_dice/best_model.pt")
+from bicbioseg import SegmenterConfig, TrainingConfig
 
-model.inference(
+model = Segmenter.from_config(
+    SegmenterConfig(
+        architecture="unet",
+        loss="dice",
+        image_size=(224, 224),
+        device="auto",
+    )
+)
+
+model.train(
+    data="cell_dataset",
+    config=TrainingConfig(
+        epochs=50,
+        batch_size=8,
+        early_stopping=True,
+        patience=10,
+    ),
+)
+```
+
+## Inference
+
+Load a checkpoint:
+
+```python
+from bicbioseg import Segmenter
+
+model = Segmenter.load("experiments/unet_dice/best_model.pt")
+```
+
+Run folder inference:
+
+```python
+predictions = model.inference(
     images="new_images",
     save_to="predictions",
     save_overlay=True,
@@ -224,8 +361,6 @@ model.inference_large_image(
 Ensemble multiple checkpoints:
 
 ```python
-from bicbioseg import Segmenter
-
 Segmenter.ensemble_predict(
     checkpoints=[
         "experiments/unet_dice/best_model.pt",
@@ -239,8 +374,6 @@ Segmenter.ensemble_predict(
 Plot inference results:
 
 ```python
-predictions = model.inference("test/images", save_to="predictions")
-
 model.plot_inference_results(
     images="test/images",
     predictions=predictions,
@@ -250,7 +383,7 @@ model.plot_inference_results(
 
 ## Evaluation And Failure Mining
 
-Binary evaluation:
+Evaluate predictions against ground truth:
 
 ```python
 results = model.evaluate(
@@ -272,7 +405,7 @@ results = Segmenter.evaluate_predictions(
 )
 ```
 
-Find the worst predictions:
+Find low-performing examples:
 
 ```python
 worst = Segmenter.find_worst_predictions(
@@ -296,13 +429,11 @@ model.find_best_threshold(
 )
 ```
 
-## Experiments
+## Experiment Comparison
 
-Compare models and losses without rewriting the training loop:
+Run multiple architecture/loss combinations:
 
 ```python
-from bicbioseg import Segmenter
-
 results = Segmenter.run_experiment(
     dataset="cell_dataset",
     architectures=["unet", "attention_unet"],
@@ -330,37 +461,9 @@ Generate a run report:
 model.create_report("experiments/unet_dice")
 ```
 
-## Configs, Devices, And Environment
+## Workflow Configs
 
-```python
-from bicbioseg import Segmenter, SegmenterConfig, TrainingConfig, set_seed, environment_info
-
-set_seed(42)
-
-print(environment_info())
-print(Segmenter.available_devices())
-
-model = Segmenter.from_config(
-    SegmenterConfig(
-        architecture="unet",
-        loss="dice",
-        image_size=(224, 224),
-        device="auto",
-    )
-)
-
-model.train(
-    data="cell_dataset",
-    config=TrainingConfig(
-        epochs=50,
-        batch_size=8,
-        early_stopping=True,
-        patience=10,
-    ),
-)
-```
-
-Save/load workflow config:
+Save and load a full experiment configuration:
 
 ```python
 from bicbioseg import ExperimentConfig, SegmentationExperiment
@@ -377,10 +480,30 @@ config.save("cell_experiment_config.json")
 exp = SegmentationExperiment.from_config("cell_experiment_config.json")
 ```
 
-## Available Models And Losses
+## Reproducibility And Environment
+
+```python
+from bicbioseg import Segmenter, environment_info, set_seed
+
+set_seed(42)
+
+print(environment_info())
+print(Segmenter.available_devices())
+```
+
+## Models, Losses, And Summary
 
 ```python
 Segmenter.available_models()
 Segmenter.available_losses()
+
 model.summary(input_size=(224, 224))
 ```
+
+## Notes
+
+- Dataset patching is explicit. If `create_patches=True` is not passed, images are copied or resized as full images.
+- Training resizes loaded images to `image_size` through the dataset loader.
+- For very large images, use `inference_large_image(...)` for tiled prediction.
+- DICOM support requires the `dicom` extra.
+- Albumentations support requires the `albumentations` extra.
