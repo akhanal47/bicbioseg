@@ -6,6 +6,10 @@
 
 This project is in early release & active developemnt. APIs may evolve or changes with each releases as more biomedical workflows are added.
 
+## Stable Models
+These are the stable models as of now (more to be added in future)
+>Unet, DoubleUnet, Segformer
+
 ## Installation
 
 ```bash
