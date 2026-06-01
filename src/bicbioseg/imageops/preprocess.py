@@ -12,6 +12,10 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 import cv2
 import numpy as np
 
+from ..config import DatasetSplitConfig
+from ..exceptions import DatasetError
+from ..utils.progress import progress_iter
+
 
 PathLike = Union[str, Path]
 Source = Union[PathLike, Sequence[PathLike]]
@@ -55,9 +59,9 @@ def _load_file_paths(source: Source, valid_extensions=VALID_IMAGE_EXTENSIONS) ->
         if path.is_file() and path.suffix.lower() in {".txt", ".csv"}:
             return _read_path_list(path)
 
-        raise FileNotFoundError(f"Could not find image source: {source}")
+        raise DatasetError(f"Could not find image source: {source}")
 
-    raise ValueError("Source must be a directory, image path, text/csv list, or list of paths.")
+    raise DatasetError("Source must be a directory, image path, text/csv list, or list of paths.")
 
 
 def _stem_without_patch_suffix(path: PathLike) -> str:
@@ -93,10 +97,10 @@ def _match_image_mask_pairs(
             missing.append(image_path)
 
     if duplicate_masks:
-        raise ValueError(f"Duplicate masks found for stems: {duplicate_masks[:5]}")
+        raise DatasetError(f"Duplicate masks found for stems: {duplicate_masks[:5]}")
 
     if missing:
-        raise FileNotFoundError(
+        raise DatasetError(
             "Could not find corresponding masks for: "
             + ", ".join(Path(path).name for path in missing[:5])
         )
@@ -546,6 +550,7 @@ class ImageOps:
             "unreadable_images": [Path(path).name for path in unreadable_images],
             "unreadable_masks": [Path(path).name for path in unreadable_masks],
         }
+        report["warnings"] = ImageOps.dataset_warnings(report)
 
         if save_to is not None:
             save_path = Path(save_to)
@@ -554,6 +559,173 @@ class ImageOps:
                 json.dump(report, handle, indent=2)
 
         return report
+
+    @staticmethod
+    def dataset_warnings(report: Mapping[str, object]) -> List[str]:
+        messages = []
+        unmatched = report.get("unmatched", {})
+        if unmatched.get("images_without_masks"):
+            messages.append(f"{len(unmatched['images_without_masks'])} image(s) do not have matching masks.")
+        if unmatched.get("masks_without_images"):
+            messages.append(f"{len(unmatched['masks_without_images'])} mask(s) do not have matching images.")
+        if report.get("num_empty_masks", 0) == report.get("num_pairs", -1):
+            messages.append("All masks appear to be empty.")
+        elif report.get("num_empty_masks", 0) > 0:
+            messages.append(f"{report['num_empty_masks']} mask(s) appear to be empty.")
+
+        foreground = report.get("foreground_percent", {})
+        mean_foreground = foreground.get("mean", 0)
+        if mean_foreground < 0.1:
+            messages.append("Mean mask foreground is below 0.1%; training may be strongly imbalanced.")
+
+        if len(report.get("image_shapes", {})) > 1:
+            messages.append("Images have multiple shapes; resize or patching may be needed.")
+        if len(report.get("mask_shapes", {})) > 1:
+            messages.append("Masks have multiple shapes; check annotation consistency.")
+
+        mask_type = report.get("mask_type", {}).get("mask_type")
+        if mask_type == "color":
+            messages.append("Masks appear color-coded; convert them to label masks before training.")
+
+        return messages
+
+    @staticmethod
+    def preview_dataset(
+        images: Source,
+        masks: Source,
+        num_samples: int = 6,
+        random_seed: int = 42,
+        save_to: Optional[PathLike] = None,
+        show: bool = True,
+        figsize=None,
+    ):
+        import matplotlib.pyplot as plt
+
+        pairs = _match_image_mask_pairs(images, masks)
+        if not pairs:
+            raise ValueError("No image/mask pairs found to preview.")
+
+        rng = np.random.default_rng(random_seed)
+        selected_indices = rng.choice(len(pairs), size=min(num_samples, len(pairs)), replace=False)
+        selected_pairs = [pairs[int(idx)] for idx in selected_indices]
+        figsize = figsize or (12, 3 * len(selected_pairs))
+
+        fig, axes = plt.subplots(len(selected_pairs), 4, figsize=figsize, squeeze=False)
+        for row, (image_path, mask_path) in enumerate(selected_pairs):
+            image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if image is None or mask is None:
+                continue
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            overlay = ImageOps.overlay_mask(image, mask)
+            foreground = 100 * np.count_nonzero(mask) / mask.size
+
+            axes[row, 0].imshow(image)
+            axes[row, 0].set_title(Path(image_path).name)
+            axes[row, 1].imshow(mask, cmap="gray", interpolation="nearest")
+            axes[row, 1].set_title("Mask")
+            axes[row, 2].imshow(overlay)
+            axes[row, 2].set_title("Overlay")
+            axes[row, 3].bar(["foreground"], [foreground])
+            axes[row, 3].set_ylim(0, 100)
+            axes[row, 3].set_title(f"{foreground:.2f}%")
+            for col in range(3):
+                axes[row, col].axis("off")
+
+        fig.tight_layout()
+        if save_to is not None:
+            save_path = Path(save_to)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, bbox_inches="tight", dpi=150)
+        if show:
+            plt.show()
+        return fig
+
+    @staticmethod
+    def remove_small_objects(mask: np.ndarray, min_size: int = 64) -> np.ndarray:
+        binary = (mask > 0).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        cleaned = np.zeros_like(binary)
+        for label in range(1, num_labels):
+            if stats[label, cv2.CC_STAT_AREA] >= min_size:
+                cleaned[labels == label] = 1
+        return (cleaned * 255).astype(np.uint8)
+
+    @staticmethod
+    def fill_holes(mask: np.ndarray) -> np.ndarray:
+        try:
+            from scipy import ndimage
+        except ImportError as exc:
+            raise ImportError("scipy is required for fill_holes.") from exc
+
+        filled = ndimage.binary_fill_holes(mask > 0)
+        return (filled.astype(np.uint8) * 255)
+
+    @staticmethod
+    def smooth_mask(mask: np.ndarray, kernel_size: int = 3) -> np.ndarray:
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        smoothed = cv2.morphologyEx((mask > 0).astype(np.uint8) * 255, cv2.MORPH_OPEN, kernel)
+        smoothed = cv2.morphologyEx(smoothed, cv2.MORPH_CLOSE, kernel)
+        return smoothed
+
+    @staticmethod
+    def watershed_instances(mask: np.ndarray, min_distance: int = 5) -> np.ndarray:
+        binary = (mask > 0).astype(np.uint8)
+        distance = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+        _, markers = cv2.threshold(distance, min_distance, 255, cv2.THRESH_BINARY)
+        markers = markers.astype(np.uint8)
+        num_labels, labels = cv2.connectedComponents(markers)
+        if num_labels <= 1:
+            _, labels = cv2.connectedComponents(binary)
+        return labels.astype(np.int32)
+
+    @staticmethod
+    def measure_objects(
+        mask: Union[PathLike, np.ndarray],
+        image: Optional[Union[PathLike, np.ndarray]] = None,
+        save_to: Optional[PathLike] = None,
+    ) -> List[Dict[str, float]]:
+        mask_array = cv2.imread(str(mask), cv2.IMREAD_GRAYSCALE) if isinstance(mask, (str, Path)) else mask
+        if mask_array is None:
+            raise ValueError(f"Could not read mask: {mask}")
+
+        image_array = None
+        if image is not None:
+            image_array = cv2.imread(str(image), cv2.IMREAD_GRAYSCALE) if isinstance(image, (str, Path)) else image
+            if image_array is not None and image_array.ndim == 3:
+                image_array = cv2.cvtColor(image_array, cv2.COLOR_BGR2GRAY)
+
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats((mask_array > 0).astype(np.uint8))
+        rows = []
+        for label in range(1, num_labels):
+            component = labels == label
+            contours, _ = cv2.findContours(component.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            perimeter = float(sum(cv2.arcLength(contour, True) for contour in contours))
+            row = {
+                "label": int(label),
+                "area": int(stats[label, cv2.CC_STAT_AREA]),
+                "bbox_x": int(stats[label, cv2.CC_STAT_LEFT]),
+                "bbox_y": int(stats[label, cv2.CC_STAT_TOP]),
+                "bbox_width": int(stats[label, cv2.CC_STAT_WIDTH]),
+                "bbox_height": int(stats[label, cv2.CC_STAT_HEIGHT]),
+                "centroid_x": float(centroids[label][0]),
+                "centroid_y": float(centroids[label][1]),
+                "perimeter": perimeter,
+            }
+            if image_array is not None:
+                row["mean_intensity"] = float(np.mean(image_array[component]))
+            rows.append(row)
+
+        if save_to is not None:
+            save_path = Path(save_to)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            if rows:
+                with save_path.open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+                    writer.writeheader()
+                    writer.writerows(rows)
+
+        return rows
 
     @staticmethod
     def resize_dataset(
@@ -677,8 +849,21 @@ def create_dataset_split(
     group_by: Optional[Union[str, Callable[[str], str]]] = "filename",
     random_seed: int = 42,
     overwrite: bool = False,
+    progress: bool = True,
+    config: Optional[DatasetSplitConfig] = None,
 ) -> str:
     """Create train/validate/test folders while keeping related images together."""
+    if config is not None:
+        split = config.split
+        resize = config.resize
+        create_patches = config.create_patches
+        patch_size = config.patch_size
+        balance_empty_masks = config.balance_empty_masks
+        group_by = config.group_by
+        random_seed = config.random_seed
+        overwrite = config.overwrite
+        progress = config.progress
+
     pairs = _match_image_mask_pairs(images, masks)
     split_pairs = _split_groups(pairs, split, group_by, random_seed)
     output_path = _prepare_output_dir(save_to, overwrite)
@@ -691,7 +876,7 @@ def create_dataset_split(
         mask_save_dir.mkdir(parents=True, exist_ok=True)
 
         saved_count = 0
-        for image_path, mask_path in split_items:
+        for image_path, mask_path in progress_iter(split_items, enabled=progress, desc=f"Saving {split_name}"):
             saved_count += _save_pair(
                 image_path=image_path,
                 mask_path=mask_path,
@@ -737,4 +922,5 @@ def create_train_validate_test_split(
         group_by=group_by,
         random_seed=random_seed,
         overwrite=overwrite,
+        progress=True,
     )

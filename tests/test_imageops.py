@@ -5,7 +5,7 @@ import pytest
 
 cv2 = pytest.importorskip("cv2")
 
-from bicbioseg import ImageOps, create_dataset_split
+from bicbioseg import DatasetSplitConfig, ImageOps, create_dataset_split
 
 
 def _write_pair(image_dir: Path, mask_dir: Path, stem: str, image_ext: str = ".jpg"):
@@ -27,13 +27,17 @@ def test_create_dataset_split_matches_by_stem_and_preserves_masks(tmp_path):
         _write_pair(image_dir, mask_dir, f"sample_{idx}", image_ext=".jpg")
 
     output_dir = tmp_path / "split"
+    split_config = DatasetSplitConfig(
+        split=(0.5, 0.25, 0.25),
+        resize=(16, 16),
+        overwrite=True,
+        progress=False,
+    )
     create_dataset_split(
         images=image_dir,
         masks=mask_dir,
         save_to=output_dir,
-        split=(0.5, 0.25, 0.25),
-        resize=(16, 16),
-        overwrite=True,
+        config=split_config,
     )
 
     saved_masks = list(output_dir.glob("*/masks/*.png"))
@@ -118,3 +122,28 @@ def test_dataset_qc_report_and_mask_type(tmp_path):
     assert report["foreground_percent"]["mean"] > 0
     assert report_path.exists()
     assert mask_type["mask_type"] == "binary"
+
+    preview_path = tmp_path / "preview.png"
+    fig = ImageOps.preview_dataset(image_dir, mask_dir, num_samples=1, save_to=preview_path, show=False)
+    assert fig is not None
+    assert preview_path.exists()
+
+
+def test_postprocessing_and_measurements(tmp_path):
+    mask = np.zeros((32, 32), dtype=np.uint8)
+    mask[4:12, 4:12] = 255
+    mask[20, 20] = 255
+    mask[4:12, 4:12][3:5, 3:5] = 0
+
+    cleaned = ImageOps.remove_small_objects(mask, min_size=8)
+    filled = ImageOps.fill_holes(cleaned)
+    smoothed = ImageOps.smooth_mask(filled, kernel_size=3)
+    instances = ImageOps.watershed_instances(smoothed)
+    measurements_path = tmp_path / "measurements.csv"
+    measurements = ImageOps.measure_objects(smoothed, save_to=measurements_path)
+
+    assert cleaned[20, 20] == 0
+    assert filled[7, 7] == 255
+    assert instances.shape == mask.shape
+    assert measurements
+    assert measurements_path.exists()

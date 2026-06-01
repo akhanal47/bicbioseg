@@ -6,7 +6,15 @@ import pytest
 cv2 = pytest.importorskip("cv2")
 torch = pytest.importorskip("torch")
 
-from bicbioseg import Segmenter
+from bicbioseg import (
+    ExperimentConfig,
+    Segmenter,
+    SegmenterConfig,
+    SegmentationExperiment,
+    TrainingConfig,
+    environment_info,
+    set_seed,
+)
 
 
 def test_segmenter_train_logs_and_loads_checkpoint(tmp_path):
@@ -24,6 +32,18 @@ def test_segmenter_train_logs_and_loads_checkpoint(tmp_path):
         device="cpu",
         model_kwargs={"base_channels": 2, "num_decoder_blocks": 1},
     )
+
+    assert "cpu" in Segmenter.available_devices()
+    assert str(Segmenter.resolve_device("cpu")) == "cpu"
+    assert Segmenter.from_config(
+        SegmenterConfig(
+            architecture="unet",
+            loss="dice",
+            image_size=(16, 16),
+            device="cpu",
+            model_kwargs={"base_channels": 2, "num_decoder_blocks": 1},
+        )
+    ).architecture == "unet"
 
     history = segmenter.train(
         data=(images, masks),
@@ -49,6 +69,17 @@ def test_segmenter_train_logs_and_loads_checkpoint(tmp_path):
     restored = Segmenter.load(run_dir / "final_model.pt", device="cpu")
     assert restored.architecture == "unet"
     assert restored.history["train_loss"]
+
+    resumed_history = segmenter.train(
+        data=(images, masks),
+        epochs=1,
+        batch_size=1,
+        num_workers=0,
+        resume_from=run_dir / "final_model.pt",
+        verbose=False,
+        progress_bar=False,
+    )
+    assert resumed_history["train_loss"]
 
     history_plot = run_dir / "history.png"
     fig = segmenter.plot_history(save_to=history_plot, show=False)
@@ -96,6 +127,15 @@ def test_segmenter_train_logs_and_loads_checkpoint(tmp_path):
     assert (run_dir / "predictions" / "logits" / "cell_logits.npy").exists()
     assert (run_dir / "predictions" / "contours" / "cell_contours.png").exists()
 
+    one_mask, one_overlay = segmenter.predict_one(
+        image_path,
+        save_to=run_dir / "one_prediction.png",
+        return_overlay=True,
+    )
+    assert one_mask.shape[:2] == images[0].shape[:2]
+    assert one_overlay.shape[:2] == images[0].shape[:2]
+    assert (run_dir / "one_prediction.png").exists()
+
     inference_plot = run_dir / "inference_results.png"
     fig = segmenter.plot_inference_results(
         images=inference_dir,
@@ -129,6 +169,18 @@ def test_segmenter_train_logs_and_loads_checkpoint(tmp_path):
     assert evaluation["num_samples"] == 1
     assert (run_dir / "evaluation" / "evaluation.csv").exists()
     assert (run_dir / "evaluation" / "evaluation_summary.json").exists()
+
+    threshold_result = segmenter.find_best_threshold(
+        images=inference_dir,
+        masks=mask_dir,
+        thresholds=[0.25, 0.5],
+        save_to=run_dir / "thresholds",
+    )
+    assert threshold_result["best_threshold"] in {0.25, 0.5}
+    assert (run_dir / "thresholds" / "threshold_tuning.csv").exists()
+
+    report_path = segmenter.create_report(run_dir)
+    assert report_path.endswith("report.md")
 
 
 def test_run_experiment_writes_summary(tmp_path):
@@ -176,8 +228,7 @@ def test_early_stopping(tmp_path):
         model_kwargs={"base_channels": 2, "num_decoder_blocks": 1},
     )
 
-    history = segmenter.train(
-        data=(images, masks),
+    train_config = TrainingConfig(
         epochs=3,
         batch_size=1,
         num_workers=0,
@@ -185,6 +236,76 @@ def test_early_stopping(tmp_path):
         patience=0,
         monitor="train_loss",
         verbose=False,
+        progress_bar=False,
+    )
+    history = segmenter.train(
+        data=(images, masks),
+        config=train_config,
     )
 
     assert len(history["train_loss"]) <= 3
+
+
+def test_seed_and_environment_info():
+    assert set_seed(123) == 123
+    info = environment_info()
+    assert "python" in info
+    assert "device_suggestion" in info
+
+
+def test_segmentation_experiment_workflow(tmp_path):
+    image_dir = tmp_path / "raw_images"
+    mask_dir = tmp_path / "raw_masks"
+    image_dir.mkdir()
+    mask_dir.mkdir()
+
+    for idx in range(4):
+        image = np.zeros((16, 16, 3), dtype=np.uint8)
+        image[4:12, 4:12] = 200
+        mask = np.zeros((16, 16), dtype=np.uint8)
+        mask[4:12, 4:12] = 255
+        cv2.imwrite(str(image_dir / f"sample_{idx}.png"), image)
+        cv2.imwrite(str(mask_dir / f"sample_{idx}.png"), mask)
+
+    exp_config = ExperimentConfig(
+        images=str(image_dir),
+        masks=str(mask_dir),
+        model="unet",
+        loss="dice",
+        work_dir=str(tmp_path / "experiment"),
+        image_size=(16, 16),
+        device="cpu",
+        model_kwargs={"base_channels": 2, "num_decoder_blocks": 1},
+    )
+    config_path = tmp_path / "experiment_config.json"
+    exp_config.save(config_path)
+
+    experiment = SegmentationExperiment.from_config(config_path)
+    assert experiment.save_config(tmp_path / "saved_config.json").endswith("saved_config.json")
+
+    # Direct construction remains supported.
+    direct_experiment = SegmentationExperiment(
+        images=image_dir,
+        masks=mask_dir,
+        model="unet",
+        loss="dice",
+        work_dir=tmp_path / "experiment",
+        image_size=(16, 16),
+        device="cpu",
+        model_kwargs={"base_channels": 2, "num_decoder_blocks": 1},
+    )
+    assert direct_experiment.segmenter.architecture == "unet"
+
+    dataset_dir = experiment.prepare(split=(0.5, 0.25, 0.25), overwrite=True, progress=False)
+    qc_report = experiment.qc()
+    history = experiment.train(epochs=1, batch_size=1, num_workers=0, verbose=False, progress_bar=False)
+    evaluation = experiment.evaluate()
+    predictions = experiment.predict(image_dir, save_overlay=True)
+    report = experiment.report()
+
+    assert dataset_dir
+    assert qc_report["num_pairs"] == 4
+    assert history["train_loss"]
+    assert evaluation["num_samples"] >= 1
+    assert predictions
+    assert report.endswith("report.md")
