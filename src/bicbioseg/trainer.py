@@ -821,8 +821,21 @@ class Segmenter:
         }
         config.update(overrides)
 
+        # Initialization weights are redundant when restoring the full state.
+        # Preserve the saved configuration as provenance, but never download
+        # encoder weights merely to overwrite them from this checkpoint.
+        saved_model_kwargs = dict(config["model_kwargs"])
+        restore_kwargs = dict(saved_model_kwargs)
+        architecture = config["architecture"].lower()
+        architecture = cls.MODEL_ALIASES.get(architecture, architecture)
+        if architecture == "transunet":
+            restore_kwargs["encoder_weights"] = None
+        elif architecture in {"deit", "swin_unet", "pvt_unet", "double_unet"}:
+            restore_kwargs["pretrained"] = False
+        config["model_kwargs"] = restore_kwargs
         segmenter = cls(**config)
         segmenter.model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
+        segmenter.model_kwargs = saved_model_kwargs
         segmenter.history = checkpoint.get("history", {})
         segmenter.model.eval()
         return segmenter

@@ -6,13 +6,22 @@
 
 This project is in early release & active developemnt. APIs may evolve or changes with each releases as more biomedical workflows are added.
 
-Built-in architectures: U-Net, attention U-Net variant, DoubleUNet, SegFormer, and TransUNet. These are local implementations; support does not imply benchmark parity with published models. DoubleUNet currently supports RGB binary segmentation only. TransUNet requires square images divisible by 16 and does not provide pretrained ViT weights.
+Architectures: U-Net, attention U-Net variant, DoubleUNet, SegFormer, TransUNet, and optional DeiT, Swin, and PVTv2 segmentation adaptations.
+DoubleUNet currently supports RGB binary segmentation only. TransUNet supports rectangular images with both dimensions divisible by 16, including an optional pretrained ResNet-50 CNN encoder.
 
 ## Installation
 
 ```bash
 pip install bicbioseg
 ```
+
+For DeiT, Swin, and PVTv2 encoders, install the optional maintained `timm` backend:
+
+```bash
+pip install 'bicbioseg[transformers]'
+```
+
+For full usages only, some of the TransUnet implementation e.g ResNet-50 TransUNet option, do not require `timm`.
 
 ## What The Package Provides
 
@@ -232,6 +241,103 @@ measurements = ImageOps.measure_objects(
     save_to="measurements.csv",
 )
 ```
+
+## Model Options
+
+All models plug into the same `Segmenter` and `SegmentationExperiment` training, evaluation, inference, and checkpoint APIs. Pass architecture options through `model_kwargs`. `Segmenter.available_models()` lists registered names, including models whose optional dependency may still need installation. New models return raw logits; the selected loss and inference API handle activations.
+
+| Architecture | Encoder / variants | Initialization | Input size |
+| --- | --- | --- | --- |
+| `transunet` | Local CNN; `lightweight`, `standard`, `heavy` presets | Random | Height and width divisible by 16 |
+| `transunet` with `encoder_name="resnet50"` | Torchvision ResNet-50 through layer3 + local transformer | Optional ImageNet CNN weights | Height and width divisible by 16 |
+| `deit` | `tiny` (default), `small`, `base`; optional `distilled=True` | Optional ImageNet encoder weights | Rectangular and odd sizes; padded to 16 then cropped |
+| `swin_unet` | Swin `tiny` (default), `small`, `base` | Optional ImageNet encoder weights | Rectangular and odd sizes; padded to 32 then cropped |
+| `pvt_unet` | PVTv2 `b0` (default) through `b5` | Optional ImageNet encoder weights | Rectangular and odd sizes; padded to 32 then cropped |
+
+Aliases include `trans_unet`, `deit_seg`, `swin` / `swinunet`, and `pvt` / `pvtv2`. The new pretrained encoder paths support RGB and grayscale inputs and binary or multiclass outputs. Grayscale is repeated to RGB internally. The custom TransUNet CNN also supports other channel counts when normalization is disabled.
+
+### Configurable TransUNet
+
+```python
+from bicbioseg import Segmenter
+
+model = Segmenter(
+    architecture="transunet",
+    image_size=(224, 320),
+    in_channels=1,
+    num_classes=3,
+    loss="cross_entropy",
+    model_kwargs={
+        "preset": "lightweight",
+        "out_channels": 32,                  # CNN width; also controls the bottleneck projection
+        "embedding_dim": 256,                # transformer width, independent of CNN width
+        "head_num": 8,                       # must divide embedding_dim
+        "mlp_dim": 1024,
+        "block_num": 4,
+        "decoder_channels": [128, 64, 32, 16], # four stages, deepest to shallowest
+        "dropout": 0.1,
+        "n_skip": 3,                         # 0–3 skip connections, deepest first
+    },
+)
+```
+
+Explicit values override the preset. If omitted, `embedding_dim` is `8 * out_channels`, and decoder widths are derived from `out_channels`. `patch_dim=16` remains fixed because it describes the CNN stride; it is not a tunable raw-image patch size. Position embeddings are interpolated if the forward input uses a different valid spatial size. CNN and transformer widths, MLP size, depth, heads, decoder widths, dropout, and skip count are configurable. ResNet-50 has fixed CNN widths; there, `out_channels` controls the post-transformer bottleneck and default decoder widths.
+
+To initialize the CNN encoder from maintained torchvision weights:
+
+```python
+model = Segmenter(
+    architecture="transunet",
+    image_size=(224, 224),
+    model_kwargs={
+        "encoder_name": "resnet50",
+        "encoder_weights": "IMAGENET1K_V2",  # or IMAGENET1K_V1, DEFAULT, None
+        "out_channels": 64,
+        "embedding_dim": 512,
+        "head_num": 8,
+        "mlp_dim": 2048,
+        "block_num": 6,
+        "decoder_channels": [256, 128, 64, 32],
+    },
+)
+```
+
+`encoder_weights=None` (the default) uses random initialization. Weights are downloaded only when requested and cached by torchvision. Only the ResNet stem and layers 1–3 are retained, giving stride-16 features and three CNN skips. The local transformer and decoder are trained from scratch. Weight download or compatibility errors propagate; there is no silent fallback to random weights.
+
+This is a **ResNet-50-backed TransUNet variant**, not the paper's exact R50–ViT-B/16 architecture. The [official TransUNet repository](https://github.com/Beckschen/TransUNet) notes that its original Google weight links expired and provides an alternative project-folder copy. Its hybrid checkpoint uses a different ResNetV2 and transformer layout, so those `.npz` weights cannot be loaded into this implementation. `pretrained_vit=True` remains explicitly unsupported. The supported CNN weights come from [torchvision ResNet-50](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.resnet50.html).
+
+The default custom encoder retains its parameter names and shapes for existing configurations. Attention scaling has been corrected to divide by the square root of head width, so existing TransUNet checkpoints remain loadable but their predictions can change; re-evaluate before reuse.
+
+### DeiT, Swin, and PVTv2 Segmentation
+
+```python
+deit = Segmenter(
+    architecture="deit",
+    image_size=(224, 320),
+    model_kwargs={"variant": "tiny", "pretrained": True,
+                  "decoder_channels": [128, 64, 32, 16]},
+)
+
+swin = Segmenter(
+    architecture="swin_unet",
+    image_size=(256, 320),
+    model_kwargs={"variant": "tiny", "pretrained": True,
+                  "decoder_channels": 128, "freeze_encoder": False},
+)
+
+pvt = Segmenter(
+    architecture="pvt_unet",
+    image_size=(256, 320),
+    model_kwargs={"variant": "b0", "pretrained": False,
+                  "decoder_channels": 128},
+)
+```
+
+These options use `timm`'s named ImageNet weights: `deit_{variant}[_distilled]_patch16_224.fb_in1k`, `swin_{variant}_patch4_window7_224.ms_in1k`, and `pvt_v2_{variant}.in1k`. All default to `pretrained=False`, so constructing them without pretrained weights requires no network. Set `freeze_encoder=True` to train just the segmentation decoder; the encoder stays in evaluation mode even during training. `dropout` configures decoder dropout; pretrained backbone dimensions and attention structure remain those of the selected variant.
+
+DeiT decodes patch tokens through four convolutional upsampling stages. With `distilled=True`, both prefix tokens participate in encoder attention and are removed before spatial decoding; the wrapper does not implement teacher/student distillation training. Swin and PVTv2 use a local convolutional decoder that fuses four encoder scales. These are adaptations inspired by the research models, rather than reproductions of the pure-transformer Swin-Unet decoder or PVTFormer's exact decoder. No pretrained segmentation decoder is provided.
+
+**Preprocessing and checkpoints:** ResNet-50 TransUNet and all three `timm` adaptations normalize `[0, 1]` RGB inputs using ImageNet mean/std internally, regardless of whether initialization is pretrained. Custom TransUNet defaults to no normalization. The package's normal dataset/inference preprocessing already supplies `[0, 1]` tensors; do not normalize them a second time. Advanced users supplying already-normalized tensors directly to the model can set `normalize_input=False` (grayscale is still repeated for RGB encoders). Normalization and grayscale handling are identical during training and inference. `Segmenter.save()` stores the entire model; `Segmenter.load()` restores it without redownloading initialization weights while retaining the saved configuration. Restoring a `timm` model still requires the optional dependency.
 
 ## Training
 
@@ -521,3 +627,17 @@ model.summary(input_size=(224, 224))
 - For very large images, use `inference_large_image(...)` for tiled prediction.
 - DICOM support requires the `dicom` extra.
 - Albumentations support requires the `albumentations` extra.
+
+## Acknowledgments And Model References
+
+Some of the model implementation references
+
+- [JunZengz/dental-caries-segmentation](https://github.com/JunZengz/dental-caries-segmentation), especially its [model collection](https://github.com/JunZengz/dental-caries-segmentation/tree/main/models): Segmentation catalog & Swin and PVT decoder designs.
+
+- [Beckschen/TransUNet](https://github.com/Beckschen/TransUNet): the CNN/transformer hybrid architecture & R50–ViT pretrained checkpoints.
+
+- [facebookresearch/deit](https://github.com/facebookresearch/deit): DeiT and distilled DeiT encoder architectures and weights.
+
+- [microsoft/Swin-Transformer](https://github.com/microsoft/Swin-Transformer) and [HuCaoFighting/Swin-Unet](https://github.com/HuCaoFighting/Swin-Unet): hierarchical shifted-window encoders and U-shaped segmentation inspiration.
+
+- [whai362/PVT](https://github.com/whai362/PVT): pyramid vision transformers for dense prediction.
