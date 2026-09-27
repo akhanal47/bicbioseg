@@ -132,15 +132,19 @@ class MiT(nn.Module):
         x,
         return_layer_outputs = False
     ):
-        h, w = x.shape[-2:]
-
         layer_outputs = []
         for (get_overlap_patches, overlap_embed, layers) in self.stages:
+            h, w = x.shape[-2:]
+            def pair(value):
+                return value if isinstance(value, tuple) else (value, value)
+            kernel = pair(get_overlap_patches.kernel_size)
+            stride = pair(get_overlap_patches.stride)
+            padding = pair(get_overlap_patches.padding)
+            dilation = pair(get_overlap_patches.dilation)
+            out_h = (h + 2 * padding[0] - dilation[0] * (kernel[0] - 1) - 1) // stride[0] + 1
+            out_w = (w + 2 * padding[1] - dilation[1] * (kernel[1] - 1) - 1) // stride[1] + 1
             x = get_overlap_patches(x)
-
-            num_patches = x.shape[-1]
-            ratio = int(sqrt((h * w) / num_patches))
-            x = rearrange(x, 'b c (h w) -> b c h w', h = h // ratio)
+            x = rearrange(x, 'b c (h w) -> b c h w', h=out_h, w=out_w)
 
             x = overlap_embed(x)
             for (attn, ff) in layers:
@@ -191,6 +195,7 @@ class Segformer(nn.Module):
     def forward(self, x):
         layer_outputs = self.mit(x, return_layer_outputs = True)
 
-        fused = [to_fused(output) for output, to_fused in zip(layer_outputs, self.to_fused)]
+        fused = [F.interpolate(to_fused[0](output), size=layer_outputs[0].shape[-2:], mode="bilinear", align_corners=False)
+                 for output, to_fused in zip(layer_outputs, self.to_fused)]
         fused = torch.cat(fused, dim = 1)
         return self.to_segmentation(fused)

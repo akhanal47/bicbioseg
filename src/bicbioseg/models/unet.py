@@ -158,7 +158,7 @@ class UNet(nn.Module):
     
     @staticmethod
     def _validate_image_size(image_size, num_decoder_blocks):
-        """Validate that image size is sufficient for the number of decoder blocks."""
+        # validate that image size is sufficient for the number of decoder blocks.
         min_size = image_size if isinstance(image_size, int) else min(image_size)
         min_required = 2 ** num_decoder_blocks
         

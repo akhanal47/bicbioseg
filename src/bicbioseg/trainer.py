@@ -13,11 +13,8 @@ from torch.utils.data import DataLoader as TorchDataLoader
 
 from .config import SegmenterConfig, TrainingConfig
 from .exceptions import InferenceError, ModelError
-from .models.attention_unet import AttUNet
-from .models.doubleunet import DoubleUNet
-from .models.segformer import Segformer
-from .models.transunet import TransUNet
-from .models.unet import UNet
+from .models.registry import MODEL_ALIASES, build_model
+from .utils.preprocessing import image_tensor, read_rgb
 from .utils import losses as loss_module
 from .utils.load_data import DataLoader
 from .utils.metrics import dice_score, jac_score, precision, recall
@@ -25,18 +22,7 @@ from .utils.progress import progress_iter
 
 
 class Segmenter:
-    MODEL_ALIASES = {
-        "unet": "unet",
-        "u-net": "unet",
-        "attention_unet": "attention_unet",
-        "attunet": "attention_unet",
-        "attention-u-net": "attention_unet",
-        "double_unet": "double_unet",
-        "doubleunet": "double_unet",
-        "transunet": "transunet",
-        "trans_unet": "transunet",
-        "segformer": "segformer",
-    }
+    MODEL_ALIASES = MODEL_ALIASES
 
     LOSS_ALIASES = {
         "bce": loss_module.BCELoss,
@@ -50,7 +36,7 @@ class Segmenter:
         "iou": loss_module.JaccardLoss,
         "tversky": loss_module.TverskyLoss,
         "focal_tversky": loss_module.FocalTverskyLoss,
-        "unified_focal": loss_module.UnifiedFocalLoss,
+        "cross_entropy": torch.nn.CrossEntropyLoss,
         "sensitivity_specificity": loss_module.SensitivitySpecificityLoss,
     }
 
@@ -68,15 +54,24 @@ class Segmenter:
     ):
         self.architecture = self.MODEL_ALIASES.get(architecture.lower(), architecture.lower())
         self.loss_name = loss.lower() if isinstance(loss, str) else loss.__class__.__name__
-        self.image_size = image_size
+        self.image_size = (image_size, image_size) if isinstance(image_size, int) else tuple(image_size)
+        if len(self.image_size) != 2 or any(not isinstance(v, int) or v <= 0 for v in self.image_size):
+            raise ModelError("image_size must be a positive (height, width) pair.")
+        if num_classes < 1 or in_channels < 1:
+            raise ModelError("num_classes and in_channels must be positive.")
         self.num_classes = num_classes
         self.in_channels = in_channels
         self.model_kwargs = dict(model_kwargs or {})
         self.loss_kwargs = dict(loss_kwargs or {})
         self.device = self.resolve_device(device or "auto")
-        self.metrics = list(metrics or ["dice", "iou"])
+        self.metrics = list(dict.fromkeys("iou" if m.lower() == "jaccard" else m.lower() for m in (metrics if metrics is not None else ["dice", "iou"])))
+        unknown = set(self.metrics) - {"dice", "iou", "precision", "recall"}
+        if unknown:
+            raise ModelError(f"Unsupported metrics: {sorted(unknown)}")
         self.model = self._build_model(self.model_kwargs).to(self.device)
         self.loss_fn = self._build_loss(loss, self.loss_kwargs)
+        if isinstance(self.loss_fn, torch.nn.Module):
+            self.loss_fn.to(self.device)
         self.history: Dict[str, List[float]] = {}
 
     @classmethod
@@ -126,37 +121,17 @@ class Segmenter:
         return torch.device(device)
 
     def _build_model(self, model_kwargs: dict) -> torch.nn.Module:
-        if self.architecture == "unet":
-            kwargs = {
-                "n_channels": self.in_channels,
-                "n_classes": self.num_classes,
-                "image_size": self.image_size,
-            }
-            kwargs.update(model_kwargs)
-            return UNet(**kwargs)
+        return build_model(self.architecture, self.in_channels, self.num_classes, self.image_size, model_kwargs)
 
-        if self.architecture == "attention_unet":
-            kwargs = {"n_channels": self.in_channels, "n_classes": self.num_classes}
-            kwargs.update(model_kwargs)
-            return AttUNet(**kwargs)
-
-        if self.architecture == "double_unet":
-            kwargs = {"n_classes": self.num_classes, "pretrained": False}
-            kwargs.update(model_kwargs)
-            return DoubleUNet(**kwargs)
-
-        if self.architecture == "transunet":
-            img_dim = self.image_size[0] if isinstance(self.image_size, tuple) else self.image_size
-            kwargs = {"img_dim": img_dim, "in_channels": self.in_channels, "n_classes": self.num_classes}
-            kwargs.update(model_kwargs)
-            return TransUNet(**kwargs)
-
-        if self.architecture == "segformer":
-            kwargs = {"channels": self.in_channels, "num_classes": self.num_classes}
-            kwargs.update(model_kwargs)
-            return Segformer(**kwargs)
-
-        raise ModelError(f"Unknown architecture '{self.architecture}'. Available: {self.available_models()}")
+    def _forward_logits(self, images):
+        logits = self.model(images)
+        if not isinstance(logits, torch.Tensor) or logits.ndim != 4:
+            raise ModelError("Model must return an NCHW logits tensor.")
+        if logits.shape[:2] != (images.shape[0], self.num_classes):
+            raise ModelError("Model output batch/classes do not match the Segmenter configuration.")
+        if logits.shape[-2:] != images.shape[-2:]:
+            logits = torch.nn.functional.interpolate(logits, size=images.shape[-2:], mode="bilinear", align_corners=False)
+        return logits
 
     def _build_loss(self, loss, loss_kwargs: dict):
         if isinstance(loss, torch.nn.Module):
@@ -170,7 +145,17 @@ class Segmenter:
         if loss_key not in self.LOSS_ALIASES:
             raise ModelError(f"Unknown loss '{loss}'. Available: {self.available_losses()}")
 
-        return self.LOSS_ALIASES[loss_key](**loss_kwargs)
+        kwargs = dict(loss_kwargs)
+        if self.num_classes > 1 and loss_key not in {"dice", "jaccard", "iou", "cross_entropy"}:
+            raise ModelError(f"Loss '{loss_key}' is binary-only; use dice, jaccard, or cross_entropy for multiclass training.")
+        if self.num_classes == 1 and loss_key == "cross_entropy":
+            raise ModelError("cross_entropy requires num_classes >= 2; use bce for binary segmentation.")
+        if loss_key in {"dice", "jaccard", "iou"}:
+            mode = "binary" if self.num_classes == 1 else "multiclass"
+            if "mode" in kwargs and kwargs["mode"] != mode:
+                raise ModelError("loss_kwargs mode conflicts with num_classes.")
+            kwargs["mode"] = mode
+        return self.LOSS_ALIASES[loss_key](**kwargs)
 
     def _make_optimizer(self, optimizer: Union[str, torch.optim.Optimizer], lr: float):
         if isinstance(optimizer, torch.optim.Optimizer):
@@ -200,14 +185,17 @@ class Segmenter:
         }
 
     @staticmethod
-    def _prepare_run_dir(experiment_dir, run_name: Optional[str]) -> Optional[Path]:
+    def _prepare_run_dir(experiment_dir, run_name: Optional[str], resume_from=None) -> Optional[Path]:
         if experiment_dir is None:
             return None
 
         if run_name is None:
-            run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+            run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
 
         run_dir = Path(experiment_dir) / run_name
+        if run_dir.exists() and any(run_dir.iterdir()):
+            if resume_from is None or Path(resume_from).resolve().parent != run_dir.resolve():
+                raise FileExistsError(f"Run directory already contains results: {run_dir}. Choose a new run_name or resume a checkpoint from this directory.")
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
 
@@ -350,6 +338,7 @@ class Segmenter:
 
         return DataLoader.load_data(
             source=data,
+            in_channels=self.in_channels,
             image_size=self.image_size,
             batch_size=batch_size,
             transforms=transforms,
@@ -383,15 +372,20 @@ class Segmenter:
             train_loader = self._loader_from_data(
                 str(data_path / "train"), batch_size, transforms, num_workers, shuffle=True
             )
+            if val_data is not None:
+                return train_loader, self._loader_from_data(val_data, batch_size, None, num_workers, shuffle=False)
             validate_path = data_path / "validate"
             val_loader = None
-            if validate_path.is_dir():
+            if validate_path.is_dir() and (not (validate_path / "images").is_dir() or self._load_paths_static(validate_path / "images")):
                 val_loader = self._loader_from_data(
                     str(validate_path), batch_size, None, num_workers, shuffle=False
                 )
             return train_loader, val_loader
 
-        return self._loader_from_data(data, batch_size, transforms, num_workers, shuffle=True), None
+        return (
+            self._loader_from_data(data, batch_size, transforms, num_workers, shuffle=True),
+            self._loader_from_data(val_data, batch_size, None, num_workers, shuffle=False) if val_data is not None else None,
+        )
 
     def _prepare_targets(self, targets: torch.Tensor) -> torch.Tensor:
         targets = targets.to(self.device)
@@ -399,24 +393,28 @@ class Segmenter:
             if targets.ndim == 3:
                 targets = targets.unsqueeze(1)
             return (targets > 0).float()
+        if targets.ndim == 4 and targets.shape[1] == 1:
+            targets = targets[:, 0]
+        if targets.ndim != 3 or (targets < 0).any() or (targets >= self.num_classes).any() or (targets != targets.long()).any():
+            raise ModelError(f"Multiclass targets must have shape NHW and integer IDs in [0, {self.num_classes - 1}].")
         return targets.long()
 
     def _metric_values(self, outputs: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
-        values = {}
-        if self.num_classes == 1:
-            preds = (torch.sigmoid(outputs) > 0.5).float()
-            target_values = (targets > 0).float()
-        else:
-            preds = torch.argmax(outputs, dim=1)
-            target_values = targets
-
-        for metric in self.metrics:
-            metric_key = metric.lower()
-            if metric_key == "dice":
-                values["dice"] = float(dice_score(target_values, preds).detach().cpu())
-            elif metric_key in {"iou", "jaccard"}:
-                values["iou"] = float(jac_score(target_values, preds).detach().cpu())
-        return values
+        predictions = (outputs.sigmoid()[:, 0] > 0.5) if self.num_classes == 1 else outputs.argmax(dim=1)
+        targets = targets[:, 0] if targets.ndim == 4 else targets
+        values = {name: [] for name in self.metrics}
+        functions = {"dice": dice_score, "iou": jac_score, "precision": precision, "recall": recall}
+        # same image-wise foreground macro averaging used by evaluate_predictions.
+        for prediction, target in zip(predictions, targets):
+            classes = [None] if self.num_classes == 1 else range(1, self.num_classes)
+            for name in self.metrics:
+                scores = []
+                for class_id in classes:
+                    pred = prediction if class_id is None else prediction == class_id
+                    truth = target > 0 if class_id is None else target == class_id
+                    scores.append(functions[name](truth.float(), pred.float()))
+                values[name].append(torch.stack(scores).mean())
+        return {name: float(torch.stack(scores).mean().detach().cpu()) for name, scores in values.items()}
 
     @staticmethod
     def _tensor_image_to_numpy(image: torch.Tensor) -> np.ndarray:
@@ -510,7 +508,7 @@ class Segmenter:
         is_train = optimizer is not None
         self.model.train(is_train)
         totals: Dict[str, float] = {"loss": 0.0}
-        batches = 0
+        samples = 0
 
         for images, targets in loader:
             images = images.to(self.device)
@@ -520,19 +518,22 @@ class Segmenter:
                 optimizer.zero_grad()
 
             with torch.set_grad_enabled(is_train):
-                outputs = self.model(images)
+                outputs = self._forward_logits(images)
                 loss = self.loss_fn(outputs, targets)
                 if is_train:
                     loss.backward()
                     optimizer.step()
 
             metric_values = self._metric_values(outputs.detach(), targets.detach())
-            totals["loss"] += float(loss.detach().cpu())
+            batch_size = images.shape[0]
+            totals["loss"] += float(loss.detach().cpu()) * batch_size
             for name, value in metric_values.items():
-                totals[name] = totals.get(name, 0.0) + value
-            batches += 1
+                totals[name] = totals.get(name, 0.0) + value * batch_size
+            samples += batch_size
 
-        return {name: value / max(1, batches) for name, value in totals.items()}
+        if samples == 0:
+            raise ValueError("Cannot train or validate on an empty loader.")
+        return {name: value / samples for name, value in totals.items()}
 
     def _load_checkpoint_for_resume(self, path: Union[str, os.PathLike], optimizer=None):
         checkpoint = torch.load(path, map_location=self.device)
@@ -595,6 +596,15 @@ class Segmenter:
             transforms=transforms,
             num_workers=num_workers,
         )
+        if epochs < 1 or patience < 0 or min_delta < 0:
+            raise ValueError("epochs must be positive; patience and min_delta must be nonnegative.")
+        if monitor_mode not in {"auto", "min", "max"}:
+            raise ValueError("monitor_mode must be 'auto', 'min', or 'max'.")
+        if val_loader is None and monitor == "val_loss":
+            monitor = "train_loss"
+        available_monitors = {f"{prefix}_{metric}" for prefix in (["train", "val"] if val_loader is not None else ["train"]) for metric in ["loss", *self.metrics]}
+        if monitor not in available_monitors:
+            raise ValueError(f"Monitor '{monitor}' is unavailable. Choose from {sorted(available_monitors)}.")
         optimizer_obj = self._make_optimizer(optimizer, lr)
         if resume_from is not None:
             self._load_checkpoint_for_resume(resume_from, optimizer=optimizer_obj)
@@ -603,10 +613,17 @@ class Segmenter:
             self.history = {"train_loss": []}
         else:
             self.history.setdefault("train_loss", [])
-        run_dir = self._prepare_run_dir(experiment_dir, run_name)
+        run_dir = self._prepare_run_dir(experiment_dir, run_name, resume_from)
+        self.last_run_dir = run_dir
         best_value = None
         stale_epochs = 0
         resolved_monitor_mode = self._monitor_mode(monitor, monitor_mode)
+        # reconstruct the best value and patience from completed epochs on resume.
+        for value in self.history.get(monitor, []):
+            if self._is_improved(value, best_value, resolved_monitor_mode, min_delta):
+                best_value, stale_epochs = value, 0
+            else:
+                stale_epochs += 1
 
         if run_dir is not None:
             config = self._config()
@@ -659,7 +676,7 @@ class Segmenter:
                 else:
                     stale_epochs += 1
 
-                if early_stopping and stale_epochs >= patience:
+                if early_stopping and not improved and stale_epochs >= patience:
                     if verbose:
                         print(f"Early stopping at epoch {epoch}; {monitor} did not improve for {patience} epoch(s).")
                     break
@@ -786,7 +803,7 @@ class Segmenter:
         loss: Optional[Union[str, torch.nn.Module, Callable]] = None,
         **overrides,
     ):
-        checkpoint = torch.load(path, map_location=device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        checkpoint = torch.load(path, map_location=cls.resolve_device(device))
         saved_image_size = checkpoint.get("image_size", (224, 224))
         if isinstance(saved_image_size, list):
             saved_image_size = tuple(saved_image_size)
@@ -807,6 +824,7 @@ class Segmenter:
         segmenter = cls(**config)
         segmenter.model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
         segmenter.history = checkpoint.get("history", {})
+        segmenter.model.eval()
         return segmenter
 
     def _load_inference_images(self, images) -> List[str]:
@@ -819,10 +837,8 @@ class Segmenter:
 
         image_path = Path(paths_or_dir)
         if image_path.is_dir():
-            paths = []
-            for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff"):
-                paths.extend(image_path.glob(ext))
-            return [str(path) for path in sorted(paths)]
+            extensions = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+            return [str(path) for path in sorted(image_path.iterdir()) if path.is_file() and path.suffix.lower() in extensions]
 
         if image_path.is_file():
             return [str(image_path)]
@@ -830,46 +846,25 @@ class Segmenter:
         raise InferenceError(f"Could not find image source: {paths_or_dir}")
 
     def _predict_array(self, rgb: np.ndarray, threshold: float = 0.5, return_raw: bool = False):
-        original_size = (rgb.shape[1], rgb.shape[0])
-        resized = cv2.resize(rgb, self.image_size, interpolation=cv2.INTER_CUBIC)
-        tensor = resized.astype(np.float32) / 255.0
-        tensor = np.transpose(tensor, (2, 0, 1))
-        tensor = torch.from_numpy(tensor).unsqueeze(0).to(self.device)
-
-        output = self.model(tensor)
-        if self.num_classes == 1:
-            logits = output[0, 0].detach().cpu().numpy()
-            probability = torch.sigmoid(output)[0, 0].detach().cpu().numpy()
-            pred = (probability > threshold).astype(np.uint8) * 255
-        else:
-            logits = output[0].detach().cpu().numpy()
-            probability = torch.softmax(output, dim=1)[0].detach().cpu().numpy()
-            pred = np.argmax(probability, axis=0).astype(np.uint8)
-
-        pred = cv2.resize(pred, original_size, interpolation=cv2.INTER_NEAREST)
-        if self.num_classes == 1:
-            probability = cv2.resize(probability, original_size, interpolation=cv2.INTER_CUBIC)
-            logits = cv2.resize(logits, original_size, interpolation=cv2.INTER_CUBIC)
-        else:
-            probability = np.stack(
-                [cv2.resize(channel, original_size, interpolation=cv2.INTER_CUBIC) for channel in probability],
-                axis=0,
-            )
-            logits = np.stack(
-                [cv2.resize(channel, original_size, interpolation=cv2.INTER_CUBIC) for channel in logits],
-                axis=0,
-            )
-
-        if return_raw:
-            return pred, probability, logits
-        return pred
+        if not 0 <= threshold <= 1:
+            raise ValueError("threshold must lie in [0, 1].")
+        tensor = image_tensor(rgb, self.image_size, self.in_channels).unsqueeze(0).to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            output = self._forward_logits(tensor)
+            output = torch.nn.functional.interpolate(output, size=rgb.shape[:2], mode="bilinear", align_corners=False)
+            if self.num_classes == 1:
+                logits = output[0, 0].cpu().numpy()
+                probability = output.sigmoid()[0, 0].cpu().numpy()
+                pred = (probability > threshold).astype(np.uint8) * 255
+            else:
+                logits = output[0].cpu().numpy()
+                probability = output.softmax(dim=1)[0].cpu().numpy()
+                pred = probability.argmax(axis=0).astype(np.uint8 if self.num_classes <= 256 else np.uint16)
+        return (pred, probability, logits) if return_raw else pred
 
     def _predict_single_image(self, image_path: Union[str, os.PathLike], threshold: float = 0.5, return_raw=False):
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if image is None:
-            raise InferenceError(f"Could not read image: {image_path}")
-
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        rgb = read_rgb(image_path)
         prediction = self._predict_array(rgb, threshold=threshold, return_raw=return_raw)
         if return_raw:
             pred, probability, logits = prediction
@@ -990,6 +985,8 @@ class Segmenter:
 
         models = [Segmenter.load(checkpoint, device=device) for checkpoint in checkpoints]
         reference = models[0]
+        if any(model.num_classes != reference.num_classes for model in models):
+            raise InferenceError("Ensemble checkpoints must have the same number and ordering of classes.")
         image_paths = reference._load_inference_images(images)
         output_dir = Path(save_to)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1000,10 +997,7 @@ class Segmenter:
         saved_paths = []
         with torch.no_grad():
             for image_path in progress_iter(image_paths, desc="Ensemble inference"):
-                image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-                if image is None:
-                    continue
-                rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                rgb = read_rgb(image_path)
 
                 probabilities = []
                 for model in models:
@@ -1014,7 +1008,7 @@ class Segmenter:
                 if reference.num_classes == 1:
                     prediction = (mean_probability > threshold).astype(np.uint8) * 255
                 else:
-                    prediction = np.argmax(mean_probability, axis=0).astype(np.uint8)
+                    prediction = np.argmax(mean_probability, axis=0).astype(np.uint8 if reference.num_classes <= 256 else np.uint16)
 
                 out_path = output_dir / f"{Path(image_path).stem}_mask.png"
                 cv2.imwrite(str(out_path), prediction)
@@ -1040,16 +1034,12 @@ class Segmenter:
     ) -> Dict[str, str]:
         self.model.eval()
         image_path = Path(image)
-        raw = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if raw is None:
-            raise ValueError(f"Could not read image: {image}")
-
-        rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+        rgb = read_rgb(image_path)
         height, width = rgb.shape[:2]
         patch_h, patch_w = patch_size
         stride_h = patch_h - overlap
         stride_w = patch_w - overlap
-        if stride_h <= 0 or stride_w <= 0:
+        if overlap < 0 or patch_h <= 0 or patch_w <= 0 or stride_h <= 0 or stride_w <= 0:
             raise ValueError("overlap must be smaller than both patch dimensions.")
 
         if self.num_classes == 1:
@@ -1101,7 +1091,7 @@ class Segmenter:
             prediction = (probability > threshold).astype(np.uint8) * 255
         else:
             probability = probability_acc / count_acc[None, :, :]
-            prediction = np.argmax(probability, axis=0).astype(np.uint8)
+            prediction = np.argmax(probability, axis=0).astype(np.uint8 if self.num_classes <= 256 else np.uint16)
 
         output_dir = Path(save_to)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1123,26 +1113,23 @@ class Segmenter:
 
     @staticmethod
     def _match_prediction_mask_pairs(predictions, masks):
-        prediction_paths = []
-        for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff"):
-            if isinstance(predictions, (str, os.PathLike)) and Path(predictions).is_dir():
-                prediction_paths.extend(Path(predictions).glob(ext))
-        if not prediction_paths:
-            prediction_paths = [Path(path) for path in (predictions if isinstance(predictions, (list, tuple)) else [predictions])]
-
-        mask_paths = []
-        for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff"):
-            if isinstance(masks, (str, os.PathLike)) and Path(masks).is_dir():
-                mask_paths.extend(Path(masks).glob(ext))
-        if not mask_paths:
-            mask_paths = [Path(path) for path in (masks if isinstance(masks, (list, tuple)) else [masks])]
-
-        masks_by_stem = {path.stem.replace("_mask", ""): path for path in mask_paths}
+        prediction_paths = [Path(path) for path in Segmenter._load_paths_static(predictions)]
+        mask_paths = [Path(path) for path in Segmenter._load_paths_static(masks)]
+        masks_by_stem = {}
+        for path in mask_paths:
+            if path.stem in masks_by_stem:
+                raise InferenceError(f"Duplicate ground-truth mask stem: {path.stem}")
+            masks_by_stem[path.stem] = path
         pairs = []
-        for pred_path in prediction_paths:
-            stem = pred_path.stem.replace("_mask", "")
-            if stem in masks_by_stem:
-                pairs.append((pred_path, masks_by_stem[stem]))
+        for path in prediction_paths:
+            # strip only the suffix written by inference, never internal '_mask'.
+            stem = path.stem.removesuffix("_mask")
+            mask = masks_by_stem.get(stem, masks_by_stem.get(path.stem))
+            if mask is None:
+                raise InferenceError(f"No ground-truth mask matches prediction: {path.name}")
+            pairs.append((path, mask))
+        if not pairs:
+            raise InferenceError("No prediction/mask pairs to evaluate.")
         return pairs
 
     @staticmethod
@@ -1178,7 +1165,7 @@ class Segmenter:
         metric_keys = [metric.lower() for metric in metrics]
         scores: Dict[str, float] = {}
 
-        if is_binary and (num_classes is None or num_classes <= 2):
+        if num_classes == 1 or (is_binary and num_classes is None):
             pred_binary = pred_np > 0
             mask_binary = mask_np > 0
             for metric in metric_keys:
@@ -1222,10 +1209,10 @@ class Segmenter:
         totals: Dict[str, List[float]] = {}
 
         for prediction_path, mask_path in pairs:
-            pred_np = cv2.imread(str(prediction_path), cv2.IMREAD_GRAYSCALE)
-            mask_np = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            pred_np = cv2.imread(str(prediction_path), cv2.IMREAD_UNCHANGED)
+            mask_np = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
             if pred_np is None or mask_np is None:
-                continue
+                raise InferenceError(f"Could not read prediction/mask pair: {prediction_path}, {mask_path}")
 
             row = {"prediction": Path(prediction_path).name, "mask": Path(mask_path).name}
             scores = Segmenter._score_prediction_arrays(
@@ -1287,7 +1274,7 @@ class Segmenter:
                 if stem not in mask_by_stem:
                     continue
                 _, _, probability, _ = self._predict_single_image(image_path, return_raw=True)
-                mask = cv2.imread(str(mask_by_stem[stem]), cv2.IMREAD_GRAYSCALE)
+                mask = cv2.imread(str(mask_by_stem[stem]), cv2.IMREAD_UNCHANGED)
                 if mask is None:
                     continue
                 if probability.shape != mask.shape:
@@ -1357,7 +1344,7 @@ class Segmenter:
             masks,
             metrics=metrics,
             save_to=save_to,
-            num_classes=num_classes,
+            num_classes=self.num_classes if num_classes is None else num_classes,
             class_names=class_names,
             include_background=include_background,
         )

@@ -14,6 +14,7 @@ authors = [
     { name = "Anup Khanal" }
 ]
 dependencies = [
+    "einops",
     "matplotlib",
     "numpy",
     "opencv-python",
