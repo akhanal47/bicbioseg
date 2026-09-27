@@ -1,156 +1,79 @@
 import os
-import glob
+from pathlib import Path
+
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import DataLoader as TorchDataLoader
-from typing import Union, List, Tuple
+
+from .preprocessing import image_tensor
+
 
 class BiosegDataset(TorchDataset):
-    def __init__(self, 
-                 images: Union[List[str], np.ndarray], 
-                 masks: Union[List[str], np.ndarray], 
-                 image_size=(224, 224), 
-                 transform=None):
-        self.images = images
-        self.masks = masks
-        self.image_size = image_size
-        self.transform = transform
-        
-        self.is_path_mode = False
-        if isinstance(self.images, list) or (isinstance(self.images, np.ndarray) and self.images.ndim == 1):
-             if len(self.images) > 0 and isinstance(self.images[0], (str, np.str_)):
-                 self.is_path_mode = True
+    def __init__(self, images, masks, image_size=(224, 224), transform=None, in_channels=3):
+        if len(images) != len(masks):
+            raise ValueError(f"Mismatched: {len(images)} images vs {len(masks)} masks")
+        if not len(images):
+            raise ValueError("Dataset contains no image/mask pairs.")
+        self.images, self.masks = images, masks
+        self.image_size, self.transform = image_size, transform
+        self.in_channels = in_channels
+        self.is_path_mode = isinstance(images[0], (str, os.PathLike, np.str_))
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
         if self.is_path_mode:
-            img_path = str(self.images[idx])
-            mask_path = str(self.masks[idx])
-            
-            image = cv2.imread(img_path, 1) 
-            mask = cv2.imread(mask_path, 0) 
-            
-            if image is None: raise ValueError(f"Image not found: {img_path}")
-            if mask is None: raise ValueError(f"Mask not found: {mask_path}")
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = cv2.imread(str(self.images[idx]), cv2.IMREAD_UNCHANGED)
+            mask = cv2.imread(str(self.masks[idx]), cv2.IMREAD_UNCHANGED)
+            if image is None or mask is None:
+                raise ValueError(f"Could not read image/mask pair: {self.images[idx]}, {self.masks[idx]}")
+            if image.ndim == 3 and image.shape[-1] == 3:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         else:
-            image = self.images[idx]
-            mask = self.masks[idx]
-            
-            if image.ndim == 2:
-                image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-
-        image = cv2.resize(image, self.image_size, interpolation=cv2.INTER_CUBIC)
-        mask = cv2.resize(mask, self.image_size, interpolation=cv2.INTER_NEAREST)
-
-        # optinal augmentation
+            image, mask = self.images[idx], self.masks[idx]
+        if mask.ndim != 2:
+            raise ValueError("Masks must be 2D class-ID arrays; convert color masks to labels first.")
+        if image.shape[:2] != mask.shape:
+            raise ValueError("Image and mask spatial dimensions must match before resizing.")
+        height, width = self.image_size
+        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
         if self.transform:
             image, mask = self.transform(image, mask)
-
-        image = image.astype(np.float32) / 255.0
-        image = np.transpose(image, (2, 0, 1))
-        
-        mask = mask.astype(np.int64) 
-        
-        return torch.from_numpy(image), torch.from_numpy(mask)
+        if not np.isfinite(mask).all() or (mask < 0).any() or not np.equal(mask, np.floor(mask)).all():
+            raise ValueError("Masks must contain nonnegative integer class IDs.")
+        return image_tensor(image, self.image_size, self.in_channels), torch.from_numpy(np.ascontiguousarray(mask, dtype=np.int64))
 
 
 class DataLoader:
-
     @staticmethod
-    def load_data(
-        source: Union[str, List, Tuple[np.ndarray, np.ndarray]] = 'train', 
-        masks_source: Union[List, np.ndarray] = None,
-        image_size=(224, 224),
-        batch_size=4,
-        transforms=None,
-        num_workers=2,
-        shuffle=True,
-        **kwargs
-    ):
-      
-        images_data = None
-        masks_data = None
-        
-        if isinstance(source, tuple) and len(source) == 2:
+    def load_data(source="train", masks_source=None, image_size=(224, 224), batch_size=4,
+                  transforms=None, num_workers=2, shuffle=True, in_channels=3, **kwargs):
+        if isinstance(source, tuple) and len(source) == 2 and masks_source is None:
             source, masks_source = source
-
-        # from dirs
-        if isinstance(source, str) and os.path.isdir(source):
-            print(f"Loading from Directory: {source}")
-            img_dir = os.path.join(source, 'images')
-            mask_dir = os.path.join(source, 'masks')
-            
-            if not os.path.exists(img_dir) or not os.path.exists(mask_dir):
-                raise FileNotFoundError("Directory must contain 'images' and 'masks' subfolders.")
-            
-            valid_exts = ['*.png', '*.jpg', '*.jpeg', '*.bmp']
-            images_data = []
-            for ext in valid_exts:
-                images_data.extend(glob.glob(os.path.join(img_dir, ext)))
-            
-            images_data.sort()
-
-            # for image in jpg but mask in png (quite often the case)
-            masks_data = []
-            for img_path in images_data:
-                file_name = os.path.basename(img_path)
-                name_no_ext = os.path.splitext(file_name)[0]
-                
-                # search priority: png > jpg > bmp
-                found_mask = False
-                
-                for ext in [os.path.splitext(file_name)[1], '.png', '.jpg', '.jpeg', '.bmp']:
-                    potential_mask = os.path.join(mask_dir, name_no_ext + ext)
-                    if os.path.exists(potential_mask):
-                        masks_data.append(potential_mask)
-                        found_mask = True
-                        break
-                
-                if not found_mask:
-                    raise FileNotFoundError(f"Could not find a corresponding mask for {file_name} in {mask_dir}")
-                
-        # from list
-        elif isinstance(source, list):
-            print("Loading from List")
-            if masks_source is None or not isinstance(masks_source, list):
-                raise ValueError("For List mode, masks_source must be a provided as list of images.")
-            if len(source) != len(masks_source):
-                raise ValueError(f"Mismatched: {len(source)} images vs {len(masks_source)} masks")
-            images_data = source
-            masks_data = masks_source
-
-        # from array
-        elif isinstance(source, np.ndarray):
-            print("Loading from Numpy Array")
-            if masks_source is None or not isinstance(masks_source, np.ndarray):
-                raise ValueError("For Array mode, masks_source must be a provided as numpy array.")
-            if len(source) != len(masks_source):
-                raise ValueError(f"Mismatched: {len(source)} images vs {len(masks_source)} masks")
-            images_data = source
-            masks_data = masks_source
-
+        if isinstance(source, (str, os.PathLike)):
+            # local import avoids coupling package initialization to image operations.
+            from ..imageops.preprocess import _match_image_mask_pairs
+            root = Path(source)
+            if masks_source is None:
+                image_dir, mask_dir = root / "images", root / "masks"
+                if not image_dir.is_dir() or not mask_dir.is_dir():
+                    raise FileNotFoundError("Directory must contain 'images' and 'masks' subfolders.")
+            else:
+                image_dir, mask_dir = root, masks_source
+            pairs = _match_image_mask_pairs(image_dir, mask_dir)
+            images, masks = zip(*pairs) if pairs else ([], [])
+        elif isinstance(source, (list, tuple, np.ndarray)):
+            if masks_source is None:
+                raise ValueError("Provide masks_source for image lists or arrays.")
+            images, masks = source, masks_source
         else:
-            raise TypeError("Invalid source type provided.")
-
-        dataset = BiosegDataset(
-            images=images_data,
-            masks=masks_data,
-            image_size=image_size,
-            transform=transforms
-        )
-        
-        return TorchDataLoader(
-            dataset, 
-            batch_size=batch_size, 
-            shuffle=shuffle, 
-            num_workers=num_workers,
-            **kwargs
-        )
+            raise TypeError("Source must be a directory, path list, array, or (images, masks) pair.")
+        dataset = BiosegDataset(images, masks, image_size, transforms, in_channels)
+        return TorchDataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, **kwargs)
 
     @staticmethod
     def plot_samples(dataloader, num_samples=2, figsize=(12, 6)):

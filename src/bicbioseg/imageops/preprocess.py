@@ -78,6 +78,9 @@ def _match_image_mask_pairs(
     images = _load_file_paths(images_source, valid_extensions)
     masks = _load_file_paths(masks_source, valid_extensions)
 
+    image_stems = [Path(path).stem for path in images]
+    if len(image_stems) != len(set(image_stems)):
+        raise DatasetError("Duplicate image stems would overwrite dataset files; use unique sample names.")
     mask_by_stem: Dict[str, List[str]] = defaultdict(list)
     for mask_path in masks:
         mask_by_stem[Path(mask_path).stem].append(mask_path)
@@ -241,7 +244,9 @@ class ImageOps:
         is_mask: bool = False,
     ) -> np.ndarray:
         interpolation = cv2.INTER_NEAREST if is_mask else cv2.INTER_CUBIC
-        return cv2.resize(image, size, interpolation=interpolation)
+        # public image and patch dimensions consistently use (height, width).
+        height, width = size
+        return cv2.resize(image, (width, height), interpolation=interpolation)
 
     @staticmethod
     def create_patches(
@@ -303,7 +308,7 @@ class ImageOps:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
 
         if mask.shape[:2] != image.shape[:2]:
-            mask = ImageOps.resize_image(mask, (image.shape[1], image.shape[0]), is_mask=True)
+            mask = ImageOps.resize_image(mask, image.shape[:2], is_mask=True)
 
         overlay = image.copy()
         color_arr = np.array(color, dtype=np.uint8)
@@ -320,7 +325,7 @@ class ImageOps:
         foreground_value: int = 1,
         dtype=np.uint8,
     ) -> np.ndarray:
-        """Normalize common biomedical mask formats to binary or label masks."""
+        # normalize mask formats to binary or label masks.
         mode = mode.lower()
 
         if mask.ndim == 3 and mode != "color":
@@ -344,7 +349,8 @@ class ImageOps:
         color_map: Optional[Mapping[Tuple[int, int, int], int]] = None,
         background_color: Tuple[int, int, int] = (0, 0, 0),
     ) -> Tuple[np.ndarray, Dict[Tuple[int, int, int], int]]:
-        """Convert an RGB/BGR color-coded mask to integer label IDs."""
+
+        # convert an RGB/BGR color-coded mask to integer label IDs.
         if mask.ndim != 3 or mask.shape[2] < 3:
             raise ValueError("Color mask must have shape (height, width, channels).")
 
@@ -856,7 +862,8 @@ def create_dataset_split(
     progress: bool = True,
     config: Optional[DatasetSplitConfig] = None,
 ) -> str:
-    """Create train/validate/test folders while keeping related images together."""
+
+    # create train/validate/test folders while keeping related images together
     if config is not None:
         split = config.split
         resize = config.resize
@@ -870,6 +877,9 @@ def create_dataset_split(
 
     pairs = _match_image_mask_pairs(images, masks)
     split_pairs = _split_groups(pairs, split, group_by, random_seed)
+    output_root = Path(save_to).resolve()
+    if any(Path(path).resolve().is_relative_to(output_root) for pair in pairs for path in pair):
+        raise DatasetError("Dataset output must not contain source images or masks; choose a separate output directory.")
     output_path = _prepare_output_dir(save_to, overwrite)
 
     counts = {}
@@ -912,7 +922,7 @@ def create_kfold_splits(
     overwrite: bool = False,
     progress: bool = True,
 ) -> List[str]:
-    """Create K train/validate folds while keeping grouped images together."""
+    # K train/validate folds, keeps grouped images together.
     if k < 2:
         raise DatasetError("k must be at least 2 for K-fold splitting.")
 
@@ -928,6 +938,9 @@ def create_kfold_splits(
     rng = np.random.default_rng(random_seed)
     groups = list(rng.permutation(groups))
     folds = np.array_split(groups, k)
+    output_root = Path(save_to).resolve()
+    if any(Path(path).resolve().is_relative_to(output_root) for pair in pairs for path in pair):
+        raise DatasetError("Dataset output must not contain source images or masks; choose a separate output directory.")
     output_path = _prepare_output_dir(save_to, overwrite)
     created_folds = []
 
@@ -972,7 +985,7 @@ def create_train_validate_test_split(
     overwrite=False,
     group_by="filename",
 ):
-    """Backward-compatible wrapper around create_dataset_split."""
+    # this backward-compatible wrapper will be refactored time permitting
     train_ratio = max(0.0, 1.0 - val_ratio - test_ratio)
     return create_dataset_split(
         images=images_source,

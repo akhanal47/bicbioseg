@@ -213,8 +213,8 @@ class Encoder(nn.Module):
         self.vit = ViT(self.vit_img_dim, out_channels * 8, out_channels * 8,
                        head_num, mlp_dim, block_num, patch_dim=1, classification=False)
 
-        self.conv2 = nn.Conv2d(out_channels * 8, 512, kernel_size=3, stride=1, padding=1)
-        self.norm2 = nn.BatchNorm2d(512)
+        self.conv2 = nn.Conv2d(out_channels * 8, out_channels * 4, kernel_size=3, stride=1, padding=1)
+        self.norm2 = nn.BatchNorm2d(out_channels * 4)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -296,6 +296,10 @@ class TransUNet(nn.Module):
     ):
         super().__init__()
 
+        if pretrained_vit:
+            raise NotImplementedError("Pretrained ViT weights are not implemented; use pretrained_vit=False.")
+        if preset is not None and preset not in self.PRESETS:
+            raise ValueError(f"Unknown TransUNet preset: {preset}")
         # Apply preset if specified
         if preset and preset in self.PRESETS:
             preset_config = self.PRESETS[preset]
@@ -312,6 +316,10 @@ class TransUNet(nn.Module):
             block_num = block_num or 8
             patch_dim = patch_dim or 16
 
+        if patch_dim != 16:
+            raise ValueError("TransUNet's encoder has fixed stride 16; patch_dim must be 16.")
+        if out_channels < 8 or (out_channels * 8) % head_num:
+            raise ValueError("out_channels must be >= 8 and out_channels * 8 must be divisible by head_num.")
         # Validate img_dim is divisible by patch_dim
         if img_dim % patch_dim != 0:
             raise ValueError(f"img_dim ({img_dim}) must be divisible by patch_dim ({patch_dim})")
@@ -333,9 +341,6 @@ class TransUNet(nn.Module):
 
         self.decoder = Decoder(out_channels, n_classes)
 
-        # TODO: Load pretrained ViT weights if pretrained_vit=True
-        if pretrained_vit:
-            print("Warning: Pretrained ViT loading not yet implemented")
 
     def forward(self, x):
         x, x1, x2, x3 = self.encoder(x)

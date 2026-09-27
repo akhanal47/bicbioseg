@@ -6,9 +6,7 @@
 
 This project is in early release & active developemnt. APIs may evolve or changes with each releases as more biomedical workflows are added.
 
-## Stable Models
-These are the stable models as of now (more to be added in future)
->Unet, DoubleUnet, Segformer
+Built-in architectures: U-Net, attention U-Net variant, DoubleUNet, SegFormer, and TransUNet. These are local implementations; support does not imply benchmark parity with published models. DoubleUNet currently supports RGB binary segmentation only. TransUNet requires square images divisible by 16 and does not provide pretrained ViT weights.
 
 ## Installation
 
@@ -257,6 +255,18 @@ history = model.train(
     run_name="unet_dice",
     early_stopping=True,
     patience=10,
+)
+```
+
+Example multiclass setup:
+
+```python
+model = Segmenter(
+    architecture="unet",
+    num_classes=3,
+    in_channels=1,
+    image_size=(256, 384),
+    loss="cross_entropy",
 )
 ```
 

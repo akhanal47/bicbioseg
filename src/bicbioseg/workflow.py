@@ -135,33 +135,29 @@ class SegmentationExperiment:
 
     def train(self, epochs: int = 1, batch_size: int = 4, config: Optional[TrainingConfig] = None, **kwargs):
         data = kwargs.pop("data", self.dataset_dir)
-        if config is not None:
-            epochs = config.epochs
-            batch_size = config.batch_size
-        return self.segmenter.train(
-            data=data,
-            epochs=epochs,
-            batch_size=batch_size,
-            config=config,
-            experiment_dir=self.run_dir.parent,
-            run_name=self.run_dir.name,
-            **kwargs,
-        )
+        kwargs.setdefault("experiment_dir", self.run_dir.parent)
+        kwargs.setdefault("run_name", self.run_dir.name)
+        result = self.segmenter.train(data=data, epochs=epochs, batch_size=batch_size, config=config, **kwargs)
+        directory = config.experiment_dir if config and config.experiment_dir is not None else kwargs["experiment_dir"]
+        name = config.run_name if config and config.run_name is not None else kwargs["run_name"]
+        if directory is not None and name is not None:
+            self.run_dir = Path(directory) / name
+        return result
 
     def evaluate(self, split: str = "test", **kwargs):
         images = kwargs.pop("images", self.dataset_dir / split / "images")
         masks = kwargs.pop("masks", self.dataset_dir / split / "masks")
+        kwargs.setdefault("save_to", self.evaluation_dir)
         return self.segmenter.evaluate(
             images=images,
             masks=masks,
-            save_to=self.evaluation_dir,
             **kwargs,
         )
 
     def predict(self, images, **kwargs):
+        kwargs.setdefault("save_to", self.prediction_dir)
         return self.segmenter.inference(
             images=images,
-            save_to=self.prediction_dir,
             **kwargs,
         )
 

@@ -15,7 +15,7 @@ class ConvertImage:
     def _resize_image(pil_image: Image.Image, resize: Tuple[int, int] = (224, 224)) -> Image.Image:
         if not (isinstance(resize[0], int) and isinstance(resize[1], int)):
             raise ValueError(f"The x, y size in {resize} should be int.")
-        return pil_image.resize(resize)
+        return pil_image.resize((resize[1], resize[0]))
 
     @staticmethod
     def _read_tiff_image(
