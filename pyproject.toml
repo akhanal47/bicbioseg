@@ -35,6 +35,7 @@ Issues = "https://github.com/akhanal47/bicbioseg/issues"
 dicom = ["pydicom"]
 dev = ["pytest"]
 albumentations = ["albumentations"]
+transformers = ["timm>=1.0.25,<2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

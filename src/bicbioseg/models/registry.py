@@ -20,6 +20,9 @@ MODEL_SPECS = {
     "double_unet": ModelSpec("doubleunet", "DoubleUNet", None, "n_classes", aliases=("doubleunet",)),
     "transunet": ModelSpec("transunet", "TransUNet", "in_channels", "n_classes", "img_dim", ("trans_unet",)),
     "segformer": ModelSpec("segformer", "Segformer", "channels", "num_classes"),
+    "deit": ModelSpec("transformer_segmentation", "DeiTSegmenter", "in_channels", "n_classes", aliases=("deit_seg",)),
+    "swin_unet": ModelSpec("transformer_segmentation", "SwinUNet", "in_channels", "n_classes", aliases=("swin", "swinunet")),
+    "pvt_unet": ModelSpec("transformer_segmentation", "PVTUNet", "in_channels", "n_classes", aliases=("pvt", "pvtv2")),
 }
 MODEL_ALIASES = {alias: name for name, spec in MODEL_SPECS.items() for alias in (name, *spec.aliases)}
 
@@ -30,13 +33,11 @@ def build_model(name, in_channels, num_classes, image_size, model_kwargs):
     spec = MODEL_SPECS[name]
     if name == "double_unet" and (in_channels != 3 or num_classes != 1):
         raise ModelError("DoubleUNet currently supports only RGB binary segmentation (in_channels=3, num_classes=1).")
-    if name == "transunet" and image_size[0] != image_size[1]:
-        raise ModelError("TransUNet currently requires a square image_size.")
     contract = {spec.class_arg: num_classes}
     if spec.channel_arg:
         contract[spec.channel_arg] = in_channels
     if spec.size_arg:
-        contract[spec.size_arg] = image_size[0] if spec.size_arg == "img_dim" else image_size
+        contract[spec.size_arg] = image_size[0] if spec.size_arg == "img_dim" and image_size[0] == image_size[1] else image_size
     for key, value in contract.items():
         if key in model_kwargs and model_kwargs[key] != value:
             raise ModelError(f"model_kwargs['{key}'] conflicts with the Segmenter configuration; set it on Segmenter instead.")
