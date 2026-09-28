@@ -6,7 +6,7 @@
 
 This project is in early release & active developemnt. APIs may evolve or changes with each releases as more biomedical workflows are added.
 
-Architectures: U-Net, attention U-Net variant, DoubleUNet, SegFormer, TransUNet, ResUNet++, UNeXt, and optional DeiT, Swin, PVTv2, full Swin-Unet, and PVTFormer segmentation models.
+Architectures: U-Net, CAttention U-Net, DoubleUNet, SegFormer, TransUNet, ResUNet++, UNeXt, and optional DeiT, Swin, PVTv2, full Swin-Unet, and PVTFormer segmentation models.
 DoubleUNet currently supports RGB binary segmentation only. TransUNet supports rectangular images with both dimensions divisible by 16, including an optional pretrained ResNet-50 CNN encoder.
 
 ## Installation
@@ -248,6 +248,7 @@ All models plug into the same `Segmenter` and `SegmentationExperiment` training,
 
 | Architecture | Encoder / variants | Initialization | Input size |
 | --- | --- | --- | --- |
+| `cattention_unet` | Configurable U-Net + decoder CBAM; `base_channels=16`, `num_decoder_blocks=4` | Random | Height and width >= `2**num_decoder_blocks`; odd sizes supported |
 | `transunet` | Local CNN; `lightweight`, `standard`, `heavy` presets | Random | Height and width divisible by 16 |
 | `transunet` with `encoder_name="resnet50"` | Torchvision ResNet-50 through layer3 + local transformer | Optional ImageNet CNN weights | Height and width divisible by 16 |
 | `deit` | `tiny` (default), `small`, `base`; optional `distilled=True` | Optional ImageNet encoder weights | Rectangular and odd sizes; padded to 16 then cropped |
@@ -259,6 +260,37 @@ All models plug into the same `Segmenter` and `SegmentationExperiment` training,
 | `unext_full` | Convolutional and shifted token MLP stages; `base` (default) or `small` | Random | Padded to 32, cropped to original size |
 
 Aliases include `trans_unet`, `deit_seg`, `swin` / `swinunet`, and `pvt` / `pvtv2`. The new pretrained encoder paths support RGB and grayscale inputs and binary or multiclass outputs. Grayscale is repeated to RGB internally. The custom TransUNet CNN also supports other channel counts when normalization is disabled.
+
+### CAttention U-Net
+
+Use `Segmenter(architecture="cattention_unet")` or import `CAttentionUNet` from
+`bicbioseg.models.cattention_unet`. It shares U-Net's backbone, constructor options,
+and defaults: `base_channels=16`, `num_decoder_blocks=4` (supported range 1–8),
+`bilinear=False`, `n_channels=3`, and `n_classes=1`. `image_size` validates the
+selected depth; it does not lock the model to one resolution.
+
+```python
+model = Segmenter(
+    architecture="cattention_unet",
+    image_size=(129, 193),
+    in_channels=1,
+    num_classes=3,
+    model_kwargs={"base_channels": 8, "num_decoder_blocks": 5, "bilinear": True},
+)
+print(model.model.get_architecture_info())
+```
+
+Each decoder stage runs **upsample → concatenate skip → channel attention → spatial
+attention → double convolution**. There is one CBAM per decoder, with reduction
+ratio 8 and a 7×7 spatial kernel; the encoder and bottleneck have no CBAM. The
+channel attention hidden width is at least one, including very narrow models.
+`CAttentionUNet.calculate_max_decoder_blocks(image_size)` reports the depth limit.
+Training BatchNorm needs multiple values per channel at the bottleneck.
+
+With matching options, U-Net and CAttention U-Net differ only by CBAM in either
+upsampling mode. See the [architecture review](docs/cattention_unet.md) for equations,
+parameter counts, and the proposed controlled comparison. This configurable
+version replaces the fixed-width architecture and its legacy names/checkpoints.
 
 ### Full architectures, discovery and preflight
 
@@ -561,7 +593,7 @@ Ensemble multiple checkpoints:
 Segmenter.ensemble_predict(
     checkpoints=[
         "experiments/unet_dice/best_model.pt",
-        "experiments/attention_unet_dice/best_model.pt",
+        "experiments/cattention_unet_dice/best_model.pt",
     ],
     images="test/images",
     save_to="ensemble_predictions",
@@ -633,7 +665,7 @@ Run multiple architecture/loss combinations:
 ```python
 results = Segmenter.run_experiment(
     dataset="cell_dataset",
-    architectures=["unet", "attention_unet"],
+    architectures=["unet", "cattention_unet"],
     losses=["dice", "jaccard"],
     metrics=["dice", "iou"],
     epochs=30,
@@ -641,6 +673,10 @@ results = Segmenter.run_experiment(
     output_dir="experiments",
 )
 ```
+
+The default U-Net and CAttention U-Net configurations share the same backbone.
+For a controlled CBAM experiment, keep all model and training options matched; see the
+[controlled comparison setup](docs/cattention_unet.md#scientific-interpretation-and-planned-comparison).
 
 For separate model widths, losses, seeds and training settings, use named runs:
 

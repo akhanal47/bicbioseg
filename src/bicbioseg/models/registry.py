@@ -16,7 +16,10 @@ class ModelSpec:
 
 MODEL_SPECS = {
     "unet": ModelSpec("unet", "UNet", "n_channels", "n_classes", "image_size", ("u-net",)),
-    "attention_unet": ModelSpec("attention_unet", "AttUNet", "n_channels", "n_classes", aliases=("attunet", "attention-u-net")),
+    "cattention_unet": ModelSpec(
+        "cattention_unet", "CAttentionUNet", "n_channels", "n_classes", "image_size",
+        aliases=("cattunet", "cattention-u-net"),
+    ),
     "double_unet": ModelSpec("doubleunet", "DoubleUNet", None, "n_classes", aliases=("doubleunet",)),
     "transunet": ModelSpec("transunet", "TransUNet", "in_channels", "n_classes", "img_dim", ("trans_unet",)),
     "segformer": ModelSpec("segformer", "Segformer", "channels", "num_classes"),
@@ -34,7 +37,7 @@ MODEL_ALIASES = {alias: name for name, spec in MODEL_SPECS.items() for alias in 
 def model_metadata(name):
     descriptions = {
         "unet": "Configurable convolutional U-Net with skip connections.",
-        "attention_unet": "Convolutional U-Net with channel and spatial attention (CBAM).",
+        "cattention_unet": "Configurable CAttention U-Net with CBAM after skip concatenation in each decoder stage.",
         "double_unet": "Cascaded U-Nets with a torchvision encoder and ASPP.",
         "transunet": "CNN/ViT hybrid encoder with a convolutional skip decoder.",
         "segformer": "Hierarchical Mix Transformer with an MLP segmentation decoder.",
@@ -57,7 +60,7 @@ def model_metadata(name):
     }
     constraints = {
         "unet": "Spatial dimensions must accommodate 2**num_decoder_blocks downsampling.",
-        "attention_unet": "Spatial dimensions >=16; training BatchNorm needs multiple values per channel.",
+        "cattention_unet": "Spatial dimensions >=2**num_decoder_blocks; training BatchNorm needs multiple values per channel.",
         "double_unet": "RGB binary segmentation only; dimensions divisible by 16, >=32 recommended.",
         "transunet": "Dimensions divisible by 16; ResNet encoder accepts 1 or 3 channels.",
         "segformer": "Dimensions >=32 recommended for spatial-reduction attention.",
