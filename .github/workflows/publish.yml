@@ -132,7 +132,6 @@ jobs:
       url: https://pypi.org/project/bicbioseg/${{ needs.version.outputs.version }}/
     permissions:
       id-token: write
-    # Do not interrupt an upload. Different version bumps retain separate runs.
     concurrency:
       group: pypi-${{ needs.version.outputs.version }}
       cancel-in-progress: false
@@ -146,5 +145,4 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: release-dist/
-          # A rerun can finish a partial upload without replacing existing files.
           skip-existing: true
