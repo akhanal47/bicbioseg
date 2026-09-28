@@ -6,7 +6,7 @@
 
 This project is in early release & active developemnt. APIs may evolve or changes with each releases as more biomedical workflows are added.
 
-Architectures: U-Net, attention U-Net variant, DoubleUNet, SegFormer, TransUNet, and optional DeiT, Swin, and PVTv2 segmentation adaptations.
+Architectures: U-Net, attention U-Net variant, DoubleUNet, SegFormer, TransUNet, ResUNet++, UNeXt, and optional DeiT, Swin, PVTv2, full Swin-Unet, and PVTFormer segmentation models.
 DoubleUNet currently supports RGB binary segmentation only. TransUNet supports rectangular images with both dimensions divisible by 16, including an optional pretrained ResNet-50 CNN encoder.
 
 ## Installation
@@ -253,8 +253,34 @@ All models plug into the same `Segmenter` and `SegmentationExperiment` training,
 | `deit` | `tiny` (default), `small`, `base`; optional `distilled=True` | Optional ImageNet encoder weights | Rectangular and odd sizes; padded to 16 then cropped |
 | `swin_unet` | Swin `tiny` (default), `small`, `base` | Optional ImageNet encoder weights | Rectangular and odd sizes; padded to 32 then cropped |
 | `pvt_unet` | PVTv2 `b0` (default) through `b5` | Optional ImageNet encoder weights | Rectangular and odd sizes; padded to 32 then cropped |
+| `swin_unet_full` | Swin `tiny` (default), `small`, `base`; Swin decoder, patch expansion and skip fusion | Optional ImageNet encoder weights; new decoder | Padded to 32, cropped to original size |
+| `pvtformer_full` | PVTv2 `b3` (default), `b0`–`b5`; three-scale residual decoder and full-resolution fusion | Optional ImageNet encoder weights; new decoder | Padded to 32, cropped to original size |
+| `resunetplusplus_full` | SE residual blocks, attention gates and bridge/output ASPP; `base_channels=16` | Random | Padded to 8, minimum 16; cropped to original size |
+| `unext_full` | Convolutional and shifted token MLP stages; `base` (default) or `small` | Random | Padded to 32, cropped to original size |
 
 Aliases include `trans_unet`, `deit_seg`, `swin` / `swinunet`, and `pvt` / `pvtv2`. The new pretrained encoder paths support RGB and grayscale inputs and binary or multiclass outputs. Grayscale is repeated to RGB internally. The custom TransUNet CNN also supports other channel counts when normalization is disabled.
+
+### Full architectures, discovery and preflight
+
+```python
+import torch
+from bicbioseg import Segmenter
+
+models = Segmenter.available_models(detailed=True)
+print(models["swin_unet_full"])
+
+model = Segmenter(
+    architecture="swin_unet_full",
+    image_size=(224, 320),
+    in_channels=1,
+    device="auto",
+    model_kwargs={"variant": "tiny", "deep_supervision": True},
+)
+
+model.validate_setup((torch.rand(2, 1, 224, 320), torch.zeros(2, 224, 320)), backward=True)
+```
+
+`device="auto"` sets MPS on macOS when CUDA not available, then CPU. Explicit `"cpu"`, `"mps"`, `"cuda"`, and `"cuda:1"` are supported; unavailable backends and invalid CUDA fails. Please confirm that your device has the right CUDA and Torch Version bundled before running any experiments
 
 ### Configurable TransUNet
 
@@ -337,7 +363,7 @@ These options use `timm`'s named ImageNet weights: `deit_{variant}[_distilled]_p
 
 DeiT decodes patch tokens through four convolutional upsampling stages. With `distilled=True`, both prefix tokens participate in encoder attention and are removed before spatial decoding; the wrapper does not implement teacher/student distillation training. Swin and PVTv2 use a local convolutional decoder that fuses four encoder scales. These are adaptations inspired by the research models, rather than reproductions of the pure-transformer Swin-Unet decoder or PVTFormer's exact decoder. No pretrained segmentation decoder is provided.
 
-**Preprocessing and checkpoints:** ResNet-50 TransUNet and all three `timm` adaptations normalize `[0, 1]` RGB inputs using ImageNet mean/std internally, regardless of whether initialization is pretrained. Custom TransUNet defaults to no normalization. The package's normal dataset/inference preprocessing already supplies `[0, 1]` tensors; do not normalize them a second time. Advanced users supplying already-normalized tensors directly to the model can set `normalize_input=False` (grayscale is still repeated for RGB encoders). Normalization and grayscale handling are identical during training and inference. `Segmenter.save()` stores the entire model; `Segmenter.load()` restores it without redownloading initialization weights while retaining the saved configuration. Restoring a `timm` model still requires the optional dependency.
+**Preprocessing and checkpoints:** ResNet-50 TransUNet and all `timm` adaptations normalize `[0, 1]` RGB inputs using ImageNet mean/std internally, regardless of whether initialization is pretrained. Custom TransUNet defaults to no normalization. The package's normal dataset/inference preprocessing already supplies `[0, 1]` tensors; do not normalize them a second time. Advanced users supplying already-normalized tensors directly to the model can set `normalize_input=False` (grayscale is still repeated for RGB encoders). Normalization and grayscale handling are identical during training and inference. `Segmenter.save()` stores the entire model; `Segmenter.load()` restores it without redownloading initialization weights while retaining the saved configuration. Restoring a `timm` model still requires the optional dependency.
 
 ## Training
 
@@ -434,6 +460,54 @@ model.train(
 )
 ```
 
+### Memory controls and resumable schedules
+
+```python
+model.train(
+    data="cell_dataset",
+    epochs=50,
+    batch_size=2,
+    precision="fp32",             # CUDA: fp16 or bf16; CPU: bf16; MPS: fp32
+    accumulation_steps=4,         # one optimizer update per four microbatches
+    max_grad_norm=1.0,
+    scheduler="cosine",           # also "step", "plateau", or None
+    scheduler_kwargs={"T_max": 50, "eta_min": 1e-6},
+    aux_loss_weights=(0.4, 0.2),   # two heads when deep_supervision=True
+    experiment_dir="experiments",
+    run_name="full_swin",
+)
+```
+
+### Microscopy normalization and ignored annotations
+
+```python
+model = Segmenter(
+    architecture="unext_full",
+    in_channels=1,
+    image_size=(256, 256),
+    normalization={"mode": "dtype"},  # uint16 / 65535, uint8 / 255
+    ignore_index=255,                  # reserve 255 for unannotated pixels
+    model_kwargs={"variant": "small"},
+)
+model.train(
+    data="microscopy_dataset",
+    crop_size=(512, 512),
+    foreground_probability=0.75,
+    batch_size=2,
+)
+```
+
+Normalization policies are saved in `SegmenterConfig`, `ExperimentConfig` and checkpoints and shared by training and inference:
+
+| Mode | Behavior |
+| --- | --- |
+| `standard` (default) | uint8 divided by 255; finite floats already in [0, 1] |
+| `dtype` | Unsigned integer images divided by their dtype maximum |
+| `range` | Clip and scale a supplied `min`/`max`, e.g. `{"mode": "range", "min": 0, "max": 4095}` |
+| `percentile` | Per-image clipping/scaling using `lower`/`upper` percentiles, defaults 1/99; constant images become zero |
+
+Set `ignore_index` on `Segmenter`, not only inside loss arguments, to keep losses and metrics aligned.
+
 ## Inference
 
 Load a checkpoint:
@@ -474,10 +548,13 @@ model.inference_large_image(
     image="large_image.tif",
     patch_size=(512, 512),
     overlap=64,
+    tile_batch_size=4,
+    weighting="gaussian",
     save_to="large_predictions",
 )
 ```
 
+`tile_batch_size` controls how many tiles share a forward pass. `weighting="gaussian"` downweights tile edges (`gaussian_sigma=0.125`, as a fraction of tile size); `"uniform"` preserves the previous averaging behavior and remains the default. Partial edge tiles are padded, cropped and normalized by their accumulated weights.
 Ensemble multiple checkpoints:
 
 ```python
@@ -564,6 +641,29 @@ results = Segmenter.run_experiment(
     output_dir="experiments",
 )
 ```
+
+For separate model widths, losses, seeds and training settings, use named runs:
+
+```python
+from bicbioseg import ExperimentRunConfig, SegmenterConfig, TrainingConfig
+
+runs = {
+    "swin_tiny": ExperimentRunConfig(
+        segmenter=SegmenterConfig(architecture="swin_unet_full", model_kwargs={"variant": "tiny"}),
+        training=TrainingConfig(epochs=50, batch_size=2, accumulation_steps=4),
+        seed=42,
+    ),
+    "pvt_b0": ExperimentRunConfig(
+        segmenter=SegmenterConfig(architecture="pvtformer_full", model_kwargs={"variant": "b0", "decoder_channels": 32}),
+        training=TrainingConfig(epochs=50, batch_size=4),
+        seed=43,
+    ),
+}
+results = Segmenter.run_experiment("cell_dataset", runs=runs, output_dir="comparisons")
+runs["swin_tiny"].save("swin_run.json")
+```
+
+Each run saves its effective configuration, seed, environment, elapsed time and throughput in `experiment.json`, alongside normal checkpoints and history.
 
 Compare experiment summaries:
 

@@ -2,6 +2,9 @@ import csv
 import json
 import os
 import shutil
+import platform
+import random
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Union
@@ -11,10 +14,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader
 
-from .config import SegmenterConfig, TrainingConfig
+from .config import SegmenterConfig, TrainingConfig, ExperimentRunConfig
 from .exceptions import InferenceError, ModelError
-from .models.registry import MODEL_ALIASES, build_model
-from .utils.preprocessing import image_tensor, read_rgb
+from .models.registry import MODEL_ALIASES, build_model, model_metadata
+from .utils.preprocessing import image_tensor, read_rgb, validate_normalization, normalize_image
+from .utils.training import autocast_context, validate_training_options, make_scheduler
 from .utils import losses as loss_module
 from .utils.load_data import DataLoader
 from .utils.metrics import dice_score, jac_score, precision, recall
@@ -51,6 +55,8 @@ class Segmenter:
         device: Optional[str] = None,
         model_kwargs: Optional[dict] = None,
         loss_kwargs: Optional[dict] = None,
+        normalization: Optional[dict] = None,
+        ignore_index: Optional[int] = None,
     ):
         self.architecture = self.MODEL_ALIASES.get(architecture.lower(), architecture.lower())
         self.loss_name = loss.lower() if isinstance(loss, str) else loss.__class__.__name__
@@ -63,6 +69,13 @@ class Segmenter:
         self.in_channels = in_channels
         self.model_kwargs = dict(model_kwargs or {})
         self.loss_kwargs = dict(loss_kwargs or {})
+        self.normalization = validate_normalization(normalization)
+        if ignore_index is not None and (isinstance(ignore_index, bool) or not isinstance(ignore_index, int)):
+            raise ModelError("ignore_index must be an integer or None.")
+        self.ignore_index = ignore_index
+        self._training_options = {}
+        self._scheduler = self._scaler = None
+
         self.device = self.resolve_device(device or "auto")
         self.metrics = list(dict.fromkeys("iou" if m.lower() == "jaccard" else m.lower() for m in (metrics if metrics is not None else ["dice", "iou"])))
         unknown = set(self.metrics) - {"dice", "iou", "precision", "recall"}
@@ -75,8 +88,9 @@ class Segmenter:
         self.history: Dict[str, List[float]] = {}
 
     @classmethod
-    def available_models(cls) -> List[str]:
-        return sorted(set(cls.MODEL_ALIASES.values()))
+    def available_models(cls, detailed=False):
+        names = sorted(set(cls.MODEL_ALIASES.values()))
+        return {name: model_metadata(name) for name in names} if detailed else names
 
     @classmethod
     def available_losses(cls) -> List[str]:
@@ -94,6 +108,8 @@ class Segmenter:
             device=config.device,
             model_kwargs=config.model_kwargs,
             loss_kwargs=config.loss_kwargs,
+            normalization=config.normalization,
+            ignore_index=config.ignore_index,
         )
 
     @staticmethod
@@ -107,24 +123,32 @@ class Segmenter:
 
     @staticmethod
     def resolve_device(device: Optional[str] = "auto") -> torch.device:
-        if device in (None, "auto"):
-            if torch.cuda.is_available():
-                return torch.device("cuda")
-            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        mps_available = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+        if device is None or str(device) == "auto":
+            if platform.system() == "Darwin" and mps_available:
                 return torch.device("mps")
-            return torch.device("cpu")
-
-        if device == "cuda" and not torch.cuda.is_available():
-            raise ModelError("CUDA was requested but is not available.")
-        if device == "mps" and not (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            resolved = torch.device(device)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            raise ModelError(f"Invalid device: {device!r}.") from exc
+        if resolved.type not in {"cpu", "cuda", "mps"}:
+            raise ModelError("device must be 'auto', 'cpu', 'mps', or 'cuda[:index]'.")
+        if resolved.type == "cuda":
+            if not torch.cuda.is_available():
+                raise ModelError("CUDA was requested but is not available.")
+            if resolved.index is not None and resolved.index >= torch.cuda.device_count():
+                raise ModelError(f"CUDA device index {resolved.index} is unavailable.")
+        if resolved.type == "mps" and not mps_available:
             raise ModelError("MPS was requested but is not available.")
-        return torch.device(device)
+        if resolved.type in {"cpu", "mps"} and resolved.index not in (None, 0):
+            raise ModelError(f"{resolved.type} supports only device index 0.")
+        return resolved
 
     def _build_model(self, model_kwargs: dict) -> torch.nn.Module:
         return build_model(self.architecture, self.in_channels, self.num_classes, self.image_size, model_kwargs)
 
-    def _forward_logits(self, images):
-        logits = self.model(images)
+    def _resize_logits(self, logits, images):
         if not isinstance(logits, torch.Tensor) or logits.ndim != 4:
             raise ModelError("Model must return an NCHW logits tensor.")
         if logits.shape[:2] != (images.shape[0], self.num_classes):
@@ -133,13 +157,93 @@ class Segmenter:
             logits = torch.nn.functional.interpolate(logits, size=images.shape[-2:], mode="bilinear", align_corners=False)
         return logits
 
+    def _forward_predictions(self, images):
+        output = self.model(images)
+        if isinstance(output, dict):
+            main, aux = output.get("logits"), output.get("aux_logits", [])
+        elif isinstance(output, (tuple, list)) and output:
+            main, aux = output[0], output[1:]
+        else:
+            main, aux = output, []
+        if not isinstance(aux, (tuple, list)):
+            raise ModelError("aux_logits must be a list or tuple of NCHW tensors.")
+        return self._resize_logits(main, images), [self._resize_logits(item, images) for item in aux]
+
+    def _forward_logits(self, images):
+        return self._forward_predictions(images)[0]
+
+    def _prediction_loss(self, main, auxiliary, targets):
+        loss = self.loss_fn(main.float(), targets)
+        weights = self._training_options.get("aux_loss_weights")
+        if weights is None:
+            weights = [0.4] * len(auxiliary)
+        if (auxiliary or self.model.training) and len(weights) != len(auxiliary):
+            raise ModelError("aux_loss_weights must have one weight per auxiliary prediction.")
+        for weight, logits in zip(weights, auxiliary):
+            loss = loss + weight * self.loss_fn(logits.float(), targets)
+        return loss
+
+    def validate_setup(self, sample_batch=None, *, backward=False, precision="fp32"):
+        # check prepared NCHW tensors on the selected device without changing weights or gradients.
+        options = dict(precision=precision, accumulation_steps=1, max_grad_norm=None, aux_loss_weights=None)
+        validate_training_options(self.device, options)
+        images, targets = (sample_batch if isinstance(sample_batch, (tuple, list)) else (sample_batch, None))
+        if images is None:
+            images = torch.zeros(1, self.in_channels, *self.image_size)
+        if not isinstance(images, torch.Tensor) or images.ndim != 4 or images.shape[1] != self.in_channels:
+            raise ModelError("Preflight images must be an NCHW tensor with the configured channels.")
+        if not images.is_floating_point() or not torch.isfinite(images).all():
+            raise ModelError("Preflight images must be finite floating-point tensors after normalization.")
+        modes = [(module, module.training) for module in self.model.modules()]
+        buffers = [(buffer, buffer.clone()) for buffer in self.model.buffers()] if backward else []
+        rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if self.device.type == "cuda" else None
+        mps_rng = torch.mps.get_rng_state() if self.device.type == "mps" else None
+        try:
+            self.model.train(backward)
+            images = images.to(self.device)
+            with torch.set_grad_enabled(backward), autocast_context(self.device, precision):
+                logits, auxiliary = self._forward_predictions(images)
+                if not all(torch.isfinite(t).all() for t in [logits, *auxiliary]):
+                    raise ModelError("Model produced nonfinite logits.")
+                loss = None
+                if targets is not None:
+                    targets = self._prepare_targets(targets)
+                    loss = self._prediction_loss(logits, auxiliary, targets)
+                    if loss.ndim or not torch.isfinite(loss):
+                        raise ModelError("Loss must be a finite scalar.")
+                if backward:
+                    objective = loss if loss is not None else logits.float().square().mean()
+                    parameters = [p for p in self.model.parameters() if p.requires_grad]
+                    grads = torch.autograd.grad(objective, parameters, allow_unused=True)
+                    if not any(g is not None for g in grads) or any(g is not None and not torch.isfinite(g).all() for g in grads):
+                        raise ModelError("Preflight gradients are missing or nonfinite.")
+            return {"architecture": self.architecture, "device": str(self.device), "precision": precision,
+                    "input_shape": tuple(images.shape), "output_shape": tuple(logits.shape),
+                    "auxiliary_predictions": len(auxiliary), "backward_checked": backward,
+                    "loss": None if loss is None else float(loss.detach().cpu()), "ok": True}
+        except (RuntimeError, ValueError) as exc:
+            raise ModelError(f"Preflight failed for {self.architecture} on {self.device}: {exc}") from exc
+        finally:
+            for module, mode in modes:
+                module.training = mode
+            with torch.no_grad():
+                for buffer, saved in buffers:
+                    buffer.copy_(saved)
+            torch.set_rng_state(rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            if mps_rng is not None:
+                torch.mps.set_rng_state(mps_rng)
+
     def _build_loss(self, loss, loss_kwargs: dict):
         if isinstance(loss, torch.nn.Module):
-            return loss
+            return loss_module.IgnoreLabelsLoss(loss, self.ignore_index) if self.ignore_index is not None else loss
         if isinstance(loss, type) and issubclass(loss, torch.nn.Module):
-            return loss(**loss_kwargs)
+            result = loss(**loss_kwargs)
+            return loss_module.IgnoreLabelsLoss(result, self.ignore_index) if self.ignore_index is not None else result
         if callable(loss) and not isinstance(loss, str):
-            return loss
+            return loss_module.IgnoreLabelsLoss(loss, self.ignore_index) if self.ignore_index is not None else loss
 
         loss_key = loss.lower()
         if loss_key not in self.LOSS_ALIASES:
@@ -155,7 +259,11 @@ class Segmenter:
             if "mode" in kwargs and kwargs["mode"] != mode:
                 raise ModelError("loss_kwargs mode conflicts with num_classes.")
             kwargs["mode"] = mode
-        return self.LOSS_ALIASES[loss_key](**kwargs)
+        if "ignore_index" in kwargs:
+            if self.ignore_index != kwargs.pop("ignore_index"):
+                raise ModelError("Set ignore_index on Segmenter so losses and metrics agree.")
+        result = self.LOSS_ALIASES[loss_key](**kwargs)
+        return loss_module.IgnoreLabelsLoss(result, self.ignore_index) if self.ignore_index is not None else result
 
     def _make_optimizer(self, optimizer: Union[str, torch.optim.Optimizer], lr: float):
         if isinstance(optimizer, torch.optim.Optimizer):
@@ -181,6 +289,8 @@ class Segmenter:
             "in_channels": self.in_channels,
             "model_kwargs": self.model_kwargs,
             "loss_kwargs": self.loss_kwargs,
+            "normalization": self.normalization,
+            "ignore_index": self.ignore_index,
             "device": str(self.device),
         }
 
@@ -344,6 +454,9 @@ class Segmenter:
             transforms=transforms,
             num_workers=num_workers,
             shuffle=shuffle,
+            normalization=self.normalization,
+            ignore_index=self.ignore_index,
+            **(getattr(self, "_crop_options", {}) if shuffle else {}),
         )
 
     def _resolve_loaders(
@@ -392,10 +505,14 @@ class Segmenter:
         if self.num_classes == 1:
             if targets.ndim == 3:
                 targets = targets.unsqueeze(1)
-            return (targets > 0).float()
+            prepared = (targets > 0).float()
+            if self.ignore_index is not None:
+                prepared = prepared.masked_fill(targets == self.ignore_index, self.ignore_index)
+            return prepared
         if targets.ndim == 4 and targets.shape[1] == 1:
             targets = targets[:, 0]
-        if targets.ndim != 3 or (targets < 0).any() or (targets >= self.num_classes).any() or (targets != targets.long()).any():
+        valid = targets != self.ignore_index if self.ignore_index is not None else torch.ones_like(targets, dtype=torch.bool)
+        if targets.ndim != 3 or (targets[valid] < 0).any() or (targets[valid] >= self.num_classes).any() or (targets != targets.long()).any():
             raise ModelError(f"Multiclass targets must have shape NHW and integer IDs in [0, {self.num_classes - 1}].")
         return targets.long()
 
@@ -406,13 +523,14 @@ class Segmenter:
         functions = {"dice": dice_score, "iou": jac_score, "precision": precision, "recall": recall}
         # same image-wise foreground macro averaging used by evaluate_predictions.
         for prediction, target in zip(predictions, targets):
+            valid = target != self.ignore_index if self.ignore_index is not None else torch.ones_like(target, dtype=torch.bool)
             classes = [None] if self.num_classes == 1 else range(1, self.num_classes)
             for name in self.metrics:
                 scores = []
                 for class_id in classes:
                     pred = prediction if class_id is None else prediction == class_id
                     truth = target > 0 if class_id is None else target == class_id
-                    scores.append(functions[name](truth.float(), pred.float()))
+                    scores.append(functions[name](truth[valid].float(), pred[valid].float()))
                 values[name].append(torch.stack(scores).mean())
         return {name: float(torch.stack(scores).mean().detach().cpu()) for name, scores in values.items()}
 
@@ -439,8 +557,10 @@ class Segmenter:
     ) -> np.ndarray:
         if image.ndim == 2:
             image = np.repeat(image[..., None], 3, axis=-1)
-        if image.max() > 1:
-            image = image.astype(np.float32) / 255.0
+        if np.issubdtype(image.dtype, np.unsignedinteger):
+            image = image.astype(np.float32) / np.iinfo(image.dtype).max
+        elif image.max() > 1:
+            image = normalize_image(image, {"mode": "percentile"})
         if mask.ndim == 3:
             mask = mask[:, :, 0]
 
@@ -508,40 +628,80 @@ class Segmenter:
         is_train = optimizer is not None
         self.model.train(is_train)
         totals: Dict[str, float] = {"loss": 0.0}
-        samples = 0
+        samples = pending_batches = pending_samples = 0
+        options = self._training_options
+        precision = options.get("precision", "fp32")
+        accumulation = options.get("accumulation_steps", 1)
+        scaler = self._scaler
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+
+        def step(sample_count):
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+            # Weight microbatches by sample count, including the final partial group.
+            for parameter in self.model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.div_(sample_count)
+            if options.get("max_grad_norm") is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), options["max_grad_norm"])
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         for images, targets in loader:
             images = images.to(self.device)
             targets = self._prepare_targets(targets)
-
-            if is_train:
-                optimizer.zero_grad()
-
-            with torch.set_grad_enabled(is_train):
-                outputs = self._forward_logits(images)
-                loss = self.loss_fn(outputs, targets)
-                if is_train:
-                    loss.backward()
-                    optimizer.step()
-
-            metric_values = self._metric_values(outputs.detach(), targets.detach())
             batch_size = images.shape[0]
+            with torch.set_grad_enabled(is_train), autocast_context(self.device, precision):
+                outputs, auxiliary = self._forward_predictions(images)
+                loss = self._prediction_loss(outputs, auxiliary, targets)
+            if loss.ndim or not torch.isfinite(loss):
+                raise ModelError("Training/validation loss must be a finite scalar.")
+            if is_train:
+                weighted_loss = loss * batch_size
+                (scaler.scale(weighted_loss) if scaler is not None else weighted_loss).backward()
+                pending_batches += 1
+                pending_samples += batch_size
+                if pending_batches == accumulation:
+                    step(pending_samples)
+                    pending_batches = pending_samples = 0
+            metric_values = self._metric_values(outputs.detach().float(), targets.detach())
             totals["loss"] += float(loss.detach().cpu()) * batch_size
             for name, value in metric_values.items():
                 totals[name] = totals.get(name, 0.0) + value * batch_size
             samples += batch_size
-
+        if is_train and pending_batches:
+            step(pending_samples)
         if samples == 0:
             raise ValueError("Cannot train or validate on an empty loader.")
+        if is_train:
+            self._last_train_samples = samples
         return {name: value / samples for name, value in totals.items()}
 
-    def _load_checkpoint_for_resume(self, path: Union[str, os.PathLike], optimizer=None):
-        checkpoint = torch.load(path, map_location=self.device)
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
-        self.model.load_state_dict(state_dict)
+    def _load_checkpoint_for_resume(self, path, optimizer=None, checkpoint=None):
+        checkpoint = checkpoint if checkpoint is not None else torch.load(path, map_location="cpu")
+        self.model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
         self.history = checkpoint.get("history", self.history)
         if optimizer is not None and "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        for name, obj in (("scheduler", self._scheduler), ("scaler", self._scaler)):
+            if obj is not None and checkpoint.get(f"{name}_state_dict") is not None:
+                obj.load_state_dict(checkpoint[f"{name}_state_dict"])
+        if "python_rng_state" in checkpoint:
+            random.setstate(checkpoint["python_rng_state"])
+        if "numpy_rng_state" in checkpoint:
+            state = checkpoint["numpy_rng_state"]
+            np.random.set_state((state[0], np.asarray(state[1], dtype=np.uint32), *state[2:]))
+        if self.device.type == "mps" and "mps_rng_state" in checkpoint:
+            torch.mps.set_rng_state(checkpoint["mps_rng_state"].cpu())
+        if "torch_rng_state" in checkpoint:
+            torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+        if self.device.type == "cuda" and checkpoint.get("cuda_rng_state") is not None:
+            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
         return checkpoint
 
     def train(
@@ -552,7 +712,7 @@ class Segmenter:
         epochs: int = 1,
         batch_size: int = 4,
         lr: float = 1e-4,
-        optimizer: Union[str, torch.optim.Optimizer] = "adam",
+        optimizer: Optional[Union[str, torch.optim.Optimizer]] = None,
         transforms=None,
         num_workers: int = 2,
         save_to: Optional[Union[str, os.PathLike]] = None,
@@ -568,6 +728,14 @@ class Segmenter:
         progress_bar: bool = True,
         verbose: bool = True,
         config: Optional[TrainingConfig] = None,
+        precision: Optional[str] = None,
+        accumulation_steps: Optional[int] = None,
+        max_grad_norm: Optional[float] = None,
+        scheduler: Optional[str] = None,
+        scheduler_kwargs: Optional[dict] = None,
+        aux_loss_weights: Optional[Sequence[float]] = None,
+        crop_size=None,
+        foreground_probability: Optional[float] = None,
     ) -> Dict[str, List[float]]:
         if config is not None:
             epochs = config.epochs
@@ -587,7 +755,43 @@ class Segmenter:
             resume_from = config.resume_from if config.resume_from is not None else resume_from
             progress_bar = config.progress_bar
             verbose = config.verbose
+            precision, accumulation_steps = config.precision, config.accumulation_steps
+            max_grad_norm = config.max_grad_norm
+            scheduler, scheduler_kwargs = config.scheduler, config.scheduler_kwargs
+            aux_loss_weights = config.aux_loss_weights
+            crop_size, foreground_probability = config.crop_size, config.foreground_probability
 
+        checkpoint = torch.load(resume_from, map_location="cpu") if resume_from is not None else {}
+        saved_options = checkpoint.get("training_options", {})
+        if optimizer is None:
+            optimizer = checkpoint.get("optimizer_name", "adam")
+        if checkpoint.get("optimizer_name") and isinstance(optimizer, str) and optimizer.lower() != checkpoint["optimizer_name"]:
+            raise ValueError("Resume must use the saved optimizer type.")
+        if checkpoint:
+            for key, current in (("normalization", self.normalization), ("ignore_index", self.ignore_index)):
+                if checkpoint.get(key, {"mode": "standard"} if key == "normalization" else None) != current:
+                    raise ValueError(f"Resume {key} differs from the checkpoint; load the checkpoint with Segmenter.load first.")
+        options = dict(precision=precision, accumulation_steps=accumulation_steps,
+                       max_grad_norm=max_grad_norm, scheduler=scheduler,
+                       scheduler_kwargs=scheduler_kwargs, aux_loss_weights=aux_loss_weights,
+                       crop_size=crop_size, foreground_probability=foreground_probability)
+        defaults = dict(precision="fp32", accumulation_steps=1, max_grad_norm=None,
+                        scheduler=None, scheduler_kwargs={}, aux_loss_weights=None,
+                        crop_size=None, foreground_probability=0.0)
+        for key in options:
+            if options[key] is None:
+                options[key] = saved_options.get(key, defaults[key])
+        if options["scheduler"] == "cosine":
+            options["scheduler_kwargs"] = dict(options["scheduler_kwargs"])
+            options["scheduler_kwargs"].setdefault("T_max", epochs)
+        if saved_options and (options["scheduler"] != saved_options.get("scheduler") or
+                              options["scheduler_kwargs"] != saved_options.get("scheduler_kwargs")):
+            raise ValueError("Resume must use the saved scheduler and scheduler_kwargs.")
+        if checkpoint.get("scaler_state_dict") and options["precision"] != saved_options.get("precision"):
+            raise ValueError("Resume must use the saved precision when a gradient scaler is present.")
+        validate_training_options(self.device, options)
+        self._training_options = options
+        self._crop_options = {key: options[key] for key in ("crop_size", "foreground_probability")}
         train_loader, val_loader = self._resolve_loaders(
             data=data,
             train_data=train_data,
@@ -606,8 +810,11 @@ class Segmenter:
         if monitor not in available_monitors:
             raise ValueError(f"Monitor '{monitor}' is unavailable. Choose from {sorted(available_monitors)}.")
         optimizer_obj = self._make_optimizer(optimizer, lr)
+        self._scheduler = make_scheduler(optimizer_obj, options["scheduler"], options["scheduler_kwargs"],
+                                         epochs, self._monitor_mode(monitor, monitor_mode))
+        self._scaler = torch.amp.GradScaler("cuda") if options["precision"] == "fp16" else None
         if resume_from is not None:
-            self._load_checkpoint_for_resume(resume_from, optimizer=optimizer_obj)
+            self._load_checkpoint_for_resume(resume_from, optimizer=optimizer_obj, checkpoint=checkpoint)
 
         if resume_from is None or not self.history:
             self.history = {"train_loss": []}
@@ -625,24 +832,36 @@ class Segmenter:
             else:
                 stale_epochs += 1
 
+        self.last_training_config = {
+            **options,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "lr": optimizer_obj.param_groups[0]["lr"],
+            "optimizer": optimizer_obj.__class__.__name__,
+            "monitor": monitor,
+            "early_stopping": early_stopping,
+            "patience": patience,
+            "min_delta": min_delta,
+            "monitor_mode": resolved_monitor_mode,
+        }
         if run_dir is not None:
             config = self._config()
-            config["training"] = {
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "lr": lr,
-                "optimizer": optimizer if isinstance(optimizer, str) else optimizer.__class__.__name__,
-                "monitor": monitor,
-                "early_stopping": early_stopping,
-                "patience": patience,
-                "min_delta": min_delta,
-                "monitor_mode": resolved_monitor_mode,
-            }
+            config["training"] = self.last_training_config
             self._write_json(run_dir / "config.json", config)
 
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            torch.cuda.reset_peak_memory_stats(self.device)
+        elif self.device.type == "mps":
+            torch.mps.synchronize()
+        started = time.perf_counter()
+        processed_samples = 0
         epoch_iter = progress_iter(range(1, epochs + 1), enabled=progress_bar, desc="Training")
         for epoch in epoch_iter:
+            self.history.setdefault("lr", []).append(optimizer_obj.param_groups[0]["lr"])
             train_stats = self._run_epoch(train_loader, optimizer=optimizer_obj)
+            processed_samples += getattr(self, "_last_train_samples", 0)
             self.history["train_loss"].append(train_stats["loss"])
             for name, value in train_stats.items():
                 if name != "loss":
@@ -662,6 +881,11 @@ class Segmenter:
             if verbose:
                 print(message)
 
+            if self._scheduler is not None:
+                if options["scheduler"] == "plateau":
+                    self._scheduler.step(self.history[monitor][-1])
+                else:
+                    self._scheduler.step()
             self._update_run_artifacts(run_dir)
             monitor_values = self.history.get(monitor)
             if monitor_values:
@@ -681,6 +905,21 @@ class Segmenter:
                         print(f"Early stopping at epoch {epoch}; {monitor} did not improve for {patience} epoch(s).")
                     break
 
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        elif self.device.type == "mps":
+            torch.mps.synchronize()
+        elapsed = time.perf_counter() - started
+        self.performance = {"elapsed_seconds": elapsed, "training_samples": processed_samples,
+                            "training_samples_per_second": processed_samples / elapsed,
+                            "peak_cuda_memory_bytes": torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else None,
+                            "mps_allocated_memory_bytes": torch.mps.current_allocated_memory() if self.device.type == "mps" else None}
+        try:
+            import resource
+            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            self.performance["process_peak_rss_bytes"] = rss if platform.system() == "Darwin" else rss * 1024
+        except ImportError:
+            self.performance["process_peak_rss_bytes"] = None
         if save_to is not None:
             self.save(save_to, optimizer=optimizer_obj)
 
@@ -693,6 +932,7 @@ class Segmenter:
                     "final_metrics": {key: values[-1] for key, values in self.history.items() if values},
                     "best_monitor": monitor,
                     "best_value": best_value,
+                    "performance": self.performance,
                 },
             )
 
@@ -708,11 +948,26 @@ class Segmenter:
             "in_channels": self.in_channels,
             "model_kwargs": self.model_kwargs,
             "loss_kwargs": self.loss_kwargs,
+            "normalization": self.normalization,
+            "ignore_index": self.ignore_index,
             "model_state_dict": self.model.state_dict(),
             "history": self.history,
         }
         if optimizer is not None:
             checkpoint["optimizer_state_dict"] = optimizer.state_dict()
+        if optimizer is not None:
+            checkpoint["optimizer_name"] = optimizer.__class__.__name__.lower()
+            checkpoint["training_options"] = self._training_options
+            checkpoint["scheduler_state_dict"] = self._scheduler.state_dict() if self._scheduler is not None else None
+            checkpoint["scaler_state_dict"] = self._scaler.state_dict() if self._scaler is not None else None
+            checkpoint["torch_rng_state"] = torch.get_rng_state()
+            checkpoint["python_rng_state"] = random.getstate()
+            numpy_rng = np.random.get_state()
+            checkpoint["numpy_rng_state"] = (numpy_rng[0], numpy_rng[1].tolist(), *numpy_rng[2:])
+            if self.device.type == "mps":
+                checkpoint["mps_rng_state"] = torch.mps.get_rng_state()
+            if self.device.type == "cuda":
+                checkpoint["cuda_rng_state"] = torch.cuda.get_rng_state_all()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(checkpoint, path)
@@ -817,6 +1072,8 @@ class Segmenter:
             "in_channels": checkpoint.get("in_channels", 3),
             "model_kwargs": checkpoint.get("model_kwargs", {}),
             "loss_kwargs": checkpoint.get("loss_kwargs", {}),
+            "normalization": checkpoint.get("normalization"),
+            "ignore_index": checkpoint.get("ignore_index"),
             "device": device,
         }
         config.update(overrides)
@@ -830,7 +1087,7 @@ class Segmenter:
         architecture = cls.MODEL_ALIASES.get(architecture, architecture)
         if architecture == "transunet":
             restore_kwargs["encoder_weights"] = None
-        elif architecture in {"deit", "swin_unet", "pvt_unet", "double_unet"}:
+        elif architecture in {"deit", "swin_unet", "swin_unet_full", "pvt_unet", "pvtformer_full", "double_unet"}:
             restore_kwargs["pretrained"] = False
         config["model_kwargs"] = restore_kwargs
         segmenter = cls(**config)
@@ -861,7 +1118,7 @@ class Segmenter:
     def _predict_array(self, rgb: np.ndarray, threshold: float = 0.5, return_raw: bool = False):
         if not 0 <= threshold <= 1:
             raise ValueError("threshold must lie in [0, 1].")
-        tensor = image_tensor(rgb, self.image_size, self.in_channels).unsqueeze(0).to(self.device)
+        tensor = image_tensor(rgb, self.image_size, self.in_channels, self.normalization).unsqueeze(0).to(self.device)
         self.model.eval()
         with torch.no_grad():
             output = self._forward_logits(tensor)
@@ -1044,11 +1301,26 @@ class Segmenter:
         threshold: float = 0.5,
         save_overlay: bool = True,
         save_probability: bool = False,
+        tile_batch_size: int = 1,
+        weighting: str = "uniform",
+        gaussian_sigma: float = 0.125,
     ) -> Dict[str, str]:
+        if isinstance(tile_batch_size, bool) or not isinstance(tile_batch_size, int) or tile_batch_size < 1:
+            raise ValueError("tile_batch_size must be a positive integer.")
+        if weighting not in {"uniform", "gaussian"}:
+            raise ValueError("weighting must be 'uniform' or 'gaussian'.")
+        if not np.isfinite(gaussian_sigma) or gaussian_sigma <= 0:
+            raise ValueError("gaussian_sigma must be finite and positive.")
+        if not 0 <= threshold <= 1:
+            raise ValueError("threshold must lie in [0, 1].")
         self.model.eval()
         image_path = Path(image)
         rgb = read_rgb(image_path)
         height, width = rgb.shape[:2]
+        if len(patch_size) != 2 or any(isinstance(n, bool) or not isinstance(n, int) or n <= 0 for n in patch_size):
+            raise ValueError("patch_size must contain two positive integers.")
+        if isinstance(overlap, bool) or not isinstance(overlap, int):
+            raise ValueError("overlap must be an integer.")
         patch_h, patch_w = patch_size
         stride_h = patch_h - overlap
         stride_w = patch_w - overlap
@@ -1068,37 +1340,32 @@ class Segmenter:
         if x_starts[-1] != max(0, width - patch_w):
             x_starts.append(max(0, width - patch_w))
 
+        # Normalize once over the source image, including percentile policies, so
+        # overlap pixels have identical intensities in every tile.
+        normalized = rgb if self.normalization["mode"] == "standard" else normalize_image(rgb, self.normalization)
+        weights = np.ones((patch_h, patch_w), dtype=np.float32)
+        if weighting == "gaussian":
+            yy = (np.arange(patch_h) - (patch_h - 1) / 2) / (patch_h * gaussian_sigma)
+            xx = (np.arange(patch_w) - (patch_w - 1) / 2) / (patch_w * gaussian_sigma)
+            weights = np.maximum(np.exp(-0.5 * (yy[:, None] ** 2 + xx[None, :] ** 2)), 1e-6).astype(np.float32)
         with torch.no_grad():
             tiles = [(y, x) for y in y_starts for x in x_starts]
-            for y, x in progress_iter(tiles, desc="Tiled inference"):
-                patch = rgb[y : y + patch_h, x : x + patch_w]
-                pad_h = patch_h - patch.shape[0]
-                pad_w = patch_w - patch.shape[1]
-                if pad_h or pad_w:
-                    patch = cv2.copyMakeBorder(
-                        patch,
-                        0,
-                        pad_h,
-                        0,
-                        pad_w,
-                        borderType=cv2.BORDER_CONSTANT,
-                        value=0,
-                    )
+            for start in progress_iter(range(0, len(tiles), tile_batch_size), desc="Tiled inference"):
+                positions = tiles[start:start + tile_batch_size]
+                tensors = []
+                for y, x in positions:
+                    patch = normalized[y:y+patch_h, x:x+patch_w]
+                    pad_h, pad_w = patch_h - patch.shape[0], patch_w - patch.shape[1]
+                    patch = cv2.copyMakeBorder(patch, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
+                    tensors.append(image_tensor(patch, self.image_size, self.in_channels))
+                logits = self._forward_logits(torch.stack(tensors).to(self.device))
+                logits = torch.nn.functional.interpolate(logits, size=(patch_h, patch_w), mode="bilinear", align_corners=False)
+                probabilities = logits.sigmoid()[:, 0] if self.num_classes == 1 else logits.softmax(1)
+                for (y, x), probability in zip(positions, probabilities.float().cpu().numpy()):
+                    h, w = min(patch_h, height-y), min(patch_w, width-x)
+                    probability_acc[..., y:y+h, x:x+w] += probability[..., :h, :w] * weights[:h, :w]
+                    count_acc[y:y+h, x:x+w] += weights[:h, :w]
 
-                _, probability, _ = self._predict_array(patch, threshold=threshold, return_raw=True)
-                if probability.ndim == 3:
-                    probability = probability[..., : patch_h - pad_h, : patch_w - pad_w]
-                else:
-                    probability = probability[: patch_h - pad_h, : patch_w - pad_w]
-                valid_h, valid_w = probability.shape[-2:]
-
-                if self.num_classes == 1:
-                    probability_acc[y : y + valid_h, x : x + valid_w] += probability
-                else:
-                    probability_acc[:, y : y + valid_h, x : x + valid_w] += probability
-                count_acc[y : y + valid_h, x : x + valid_w] += 1
-
-        count_acc = np.maximum(count_acc, 1)
         if self.num_classes == 1:
             probability = probability_acc / count_acc
             prediction = (probability > threshold).astype(np.uint8) * 255
@@ -1167,12 +1434,15 @@ class Segmenter:
         num_classes: Optional[int] = None,
         class_names: Optional[Sequence[str]] = None,
         include_background: bool = False,
+        ignore_index: Optional[int] = None,
     ) -> Dict[str, float]:
         pred_np = pred_np.squeeze()
         mask_np = mask_np.squeeze()
         if pred_np.shape != mask_np.shape:
             pred_np = cv2.resize(pred_np, (mask_np.shape[1], mask_np.shape[0]), interpolation=cv2.INTER_NEAREST)
 
+        valid = mask_np != ignore_index if ignore_index is not None else np.ones(mask_np.shape, dtype=bool)
+        pred_np, mask_np = pred_np[valid], mask_np[valid]
         unique_values = set(np.unique(pred_np).tolist()) | set(np.unique(mask_np).tolist())
         is_binary = unique_values.issubset({0, 1, 255})
         metric_keys = [metric.lower() for metric in metrics]
@@ -1186,7 +1456,7 @@ class Segmenter:
             return scores
 
         if num_classes is None:
-            num_classes = int(max(np.max(pred_np), np.max(mask_np))) + 1
+            num_classes = int(max(np.max(pred_np, initial=0), np.max(mask_np, initial=0))) + 1
 
         class_ids = list(range(num_classes))
         if not include_background and 0 in class_ids:
@@ -1216,6 +1486,7 @@ class Segmenter:
         num_classes: Optional[int] = None,
         class_names: Optional[Sequence[str]] = None,
         include_background: bool = False,
+        ignore_index: Optional[int] = None,
     ) -> Dict[str, object]:
         pairs = Segmenter._match_prediction_mask_pairs(predictions, masks)
         rows = []
@@ -1235,6 +1506,7 @@ class Segmenter:
                 num_classes=num_classes,
                 class_names=class_names,
                 include_background=include_background,
+                ignore_index=ignore_index,
             )
             row.update(scores)
             for key, value in scores.items():
@@ -1293,7 +1565,7 @@ class Segmenter:
                 if probability.shape != mask.shape:
                     probability = cv2.resize(probability, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_CUBIC)
                 probabilities.append(probability)
-                ground_truths.append((mask > 0).astype(np.float32))
+                ground_truths.append(mask)
 
         if not probabilities:
             raise ValueError("No matched image/mask pairs found for threshold tuning.")
@@ -1305,8 +1577,9 @@ class Segmenter:
             scores = []
             for probability, target in zip(probabilities, ground_truths):
                 pred = (probability > threshold).astype(np.float32)
-                pred_tensor = torch.from_numpy(pred)
-                target_tensor = torch.from_numpy(target)
+                valid = target != self.ignore_index if self.ignore_index is not None else np.ones(target.shape, dtype=bool)
+                pred_tensor = torch.from_numpy(pred[valid])
+                target_tensor = torch.from_numpy((target[valid] > 0).astype(np.float32))
                 if metric_key == "dice":
                     score = float(dice_score(target_tensor, pred_tensor))
                 elif metric_key in {"iou", "jaccard"}:
@@ -1360,6 +1633,7 @@ class Segmenter:
             num_classes=self.num_classes if num_classes is None else num_classes,
             class_names=class_names,
             include_background=include_background,
+            ignore_index=self.ignore_index,
         )
 
     @staticmethod
@@ -1373,6 +1647,7 @@ class Segmenter:
         num_classes: Optional[int] = None,
         class_names: Optional[Sequence[str]] = None,
         include_background: bool = False,
+        ignore_index: Optional[int] = None,
     ) -> List[Dict[str, object]]:
         evaluation = Segmenter.evaluate_predictions(
             predictions=predictions,
@@ -1381,6 +1656,7 @@ class Segmenter:
             num_classes=num_classes,
             class_names=class_names,
             include_background=include_background,
+            ignore_index=ignore_index,
         )
         rows = evaluation["rows"]
         metric_key = metric.lower()
@@ -1495,8 +1771,8 @@ class Segmenter:
     @staticmethod
     def run_experiment(
         dataset,
-        architectures: Sequence[str],
-        losses: Sequence[str],
+        architectures: Optional[Sequence[str]] = None,
+        losses: Optional[Sequence[str]] = None,
         epochs: int = 1,
         batch_size: int = 4,
         image_size=(224, 224),
@@ -1506,48 +1782,67 @@ class Segmenter:
         model_kwargs: Optional[dict] = None,
         loss_kwargs: Optional[dict] = None,
         output_dir: Optional[Union[str, os.PathLike]] = "experiments",
+        runs: Optional[Dict[str, ExperimentRunConfig]] = None,
+        seed: int = 42,
+        device: Optional[str] = None,
         **train_kwargs,
     ) -> Dict[str, Dict[str, List[float]]]:
-        results = {}
-        summary_rows = []
-        for architecture in architectures:
-            for loss in losses:
-                run_name = f"{architecture}_{loss}"
-                print(f"Running experiment: {run_name}")
-                segmenter = Segmenter(
-                    architecture=architecture,
-                    loss=loss,
-                    metrics=metrics,
-                    image_size=image_size,
-                    num_classes=num_classes,
-                    in_channels=in_channels,
-                    model_kwargs=model_kwargs,
-                    loss_kwargs=loss_kwargs,
-                )
-                per_run_train_kwargs = dict(train_kwargs)
-                per_run_train_kwargs.setdefault("experiment_dir", output_dir)
-                per_run_train_kwargs.setdefault("run_name", run_name)
-                results[run_name] = segmenter.train(
-                    data=dataset,
-                    epochs=epochs,
-                    batch_size=batch_size,
-                    **per_run_train_kwargs,
-                )
-                final_metrics = {
-                    key: values[-1] for key, values in results[run_name].items() if values
-                }
-                summary_rows.append({"run": run_name, "architecture": architecture, "loss": loss, **final_metrics})
+        from .utils.environment import set_seed, environment_info
 
-        if output_dir is not None and summary_rows:
+        if runs is not None and (architectures is not None or losses is not None):
+            raise ValueError("Use named runs or architectures/losses, not both.")
+        if runs is None:
+            if not architectures or not losses:
+                raise ValueError("Provide named runs or nonempty architectures and losses.")
+            runs = {}
+            for architecture in architectures:
+                for loss in losses:
+                    name = f"{architecture}_{loss}"
+                    if name in runs:
+                        raise ValueError(f"Duplicate experiment name: {name}.")
+                    runs[name] = ExperimentRunConfig(
+                        segmenter=SegmenterConfig(architecture=architecture, loss=loss, metrics=metrics,
+                            image_size=image_size, num_classes=num_classes, in_channels=in_channels,
+                            model_kwargs=model_kwargs or {}, loss_kwargs=loss_kwargs or {}, device=device),
+                        training=TrainingConfig(epochs=epochs, batch_size=batch_size), seed=seed)
+        if not runs:
+            raise ValueError("runs cannot be empty.")
+        prepared = {}
+        for name, run in runs.items():
+            if not isinstance(name, str) or not name or name in {".", ".."} or Path(name).name != name or "/" in name or "\\" in name:
+                raise ValueError("Run names must be nonempty directory names without path separators.")
+            prepared[name] = ExperimentRunConfig.from_dict(run) if isinstance(run, dict) else run
+            if not isinstance(prepared[name], ExperimentRunConfig):
+                raise TypeError("Each run must be an ExperimentRunConfig or its serialized dictionary.")
+        results, summary_rows = {}, []
+        for name, run in prepared.items():
+            set_seed(run.seed)
+            segmenter = Segmenter.from_config(run.segmenter)
+            options = run.training.to_dict()
+            options.update(train_kwargs)
+            options.setdefault("experiment_dir", output_dir)
+            if options["experiment_dir"] is None:
+                options["experiment_dir"] = output_dir
+            if options.get("run_name") is None:
+                options["run_name"] = name
+            results[name] = segmenter.train(data=dataset, **options)
+            final_metrics = {key: values[-1] for key, values in results[name].items() if values}
+            row = {"run": name, "architecture": segmenter.architecture, "loss": segmenter.loss_name,
+                   "seed": run.seed, "device": str(segmenter.device), **segmenter.performance, **final_metrics}
+            summary_rows.append(row)
+            if segmenter.last_run_dir is not None:
+                Segmenter._write_json(segmenter.last_run_dir / "experiment.json", {
+                    "seed": run.seed, "segmenter": segmenter._config(), "training": segmenter.last_training_config,
+                    "environment": environment_info(), "performance": segmenter.performance})
+            del segmenter
+        if output_dir is not None:
             output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
-            fields = sorted({key for row in summary_rows for key in row})
             with (output_path / "summary.csv").open("w", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer = csv.DictWriter(handle, fieldnames=sorted({key for row in summary_rows for key in row}))
                 writer.writeheader()
                 writer.writerows(summary_rows)
             Segmenter._write_json(output_path / "summary.json", {"runs": summary_rows})
-
         return results
 
     @staticmethod

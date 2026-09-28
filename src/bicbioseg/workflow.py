@@ -22,6 +22,8 @@ class SegmentationExperiment:
         loss_kwargs: Optional[dict] = None,
         device: Optional[str] = None,
         config: Optional[ExperimentConfig] = None,
+        normalization: Optional[dict] = None,
+        ignore_index: Optional[int] = None,
     ):
         if config is not None:
             images = config.images
@@ -36,6 +38,7 @@ class SegmentationExperiment:
             model_kwargs = config.model_kwargs
             loss_kwargs = config.loss_kwargs
             device = config.device
+            normalization, ignore_index = config.normalization, config.ignore_index
 
         self.images = images
         self.masks = masks
@@ -51,6 +54,8 @@ class SegmentationExperiment:
             metrics=metrics,
             model_kwargs=model_kwargs or {},
             loss_kwargs=loss_kwargs or {},
+            normalization=normalization or {"mode": "standard"},
+            ignore_index=ignore_index,
             device=device,
         )
         self.work_dir = Path(work_dir)
@@ -68,6 +73,8 @@ class SegmentationExperiment:
             in_channels=in_channels,
             model_kwargs=model_kwargs,
             loss_kwargs=loss_kwargs,
+            normalization=normalization,
+            ignore_index=ignore_index,
             device=device,
         )
 
