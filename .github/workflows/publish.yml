@@ -1,0 +1,148 @@
+name: Publish to PyPI
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Exact project.version on develop to publish (for recovery or initial setup)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Check release version
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.11'
+      - run: python -m pip install packaging
+      - name: Detect version increase
+        id: version
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_BEFORE: ${{ github.event.before }}
+          RELEASE_REQUESTED_VERSION: ${{ inputs.version }}
+        shell: python
+        run: |
+          import os
+          import re
+          import subprocess
+          import tomllib
+          from pathlib import Path
+          from packaging.version import Version
+
+          def version(document):
+              parsed = Version(tomllib.loads(document)["project"]["version"])
+              if parsed.local is not None:
+                  raise ValueError("PyPI releases cannot use local version identifiers.")
+              return parsed
+
+          current = version(Path("pyproject.toml").read_text())
+          event = os.environ["RELEASE_EVENT"]
+          before = os.environ.get("RELEASE_BEFORE", "")
+          publish = False
+          if event == "workflow_dispatch":
+              if os.environ["RELEASE_REQUESTED_VERSION"] != str(current):
+                  raise ValueError(f"Enter the current project.version: {current}")
+              publish = True
+          elif event == "push" and before == "0" * 40:
+              print("New branch: use Run workflow for an initial release.")
+          elif event == "push":
+              if not re.fullmatch(r"[0-9a-f]{40}", before):
+                  raise ValueError("Missing or invalid push comparison commit.")
+              # Compare the entire push, including bumps before its final commit.
+              subprocess.run(["git", "cat-file", "-e", f"{before}^{{commit}}"], check=True)
+              paths = subprocess.check_output(
+                  ["git", "ls-tree", "--name-only", before, "--", "pyproject.toml"], text=True)
+              if paths.strip():
+                  previous = version(subprocess.check_output(
+                      ["git", "show", f"{before}:pyproject.toml"], text=True))
+                  if current < previous:
+                      raise ValueError(f"Version decreased from {previous} to {current}.")
+                  publish = current > previous
+              else:
+                  publish = True  # pyproject.toml was introduced in this push.
+          else:
+              raise ValueError(f"Unsupported release event: {event}")
+          print(f"Version: {current}; publish: {publish}")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"publish={str(publish).lower()}\nversion={current}\n")
+
+  build:
+    name: Test and build distributions
+    needs: version
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MPLBACKEND: Agg
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install build and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install '.[dev,transformers]' build twine
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Build fresh source distribution and wheel
+        run: |
+          python -m build --outdir release-dist
+          python -m twine check --strict release-dist/*
+      - name: Store distributions for publishing
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: python-distributions
+          path: release-dist/*
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  publish:
+    name: Publish ${{ needs.version.outputs.version }} to PyPI
+    needs: [version, build]
+    if: github.ref == 'refs/heads/develop' && needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/bicbioseg/${{ needs.version.outputs.version }}/
+    permissions:
+      id-token: write
+    concurrency:
+      group: pypi-${{ needs.version.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - name: Download tested distributions
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: python-distributions
+          path: release-dist/
+      - name: Publish using PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: release-dist/
+          skip-existing: true
