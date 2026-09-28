@@ -123,3 +123,20 @@ class ExponentialLogarithmicLoss(nn.Module):
 class ShapeAwareLoss(nn.Module):
     def __init__(self, *args, **kwargs):
         raise NotImplementedError("Shape-aware loss has no implementation yet.")
+
+
+class IgnoreLabelsLoss(nn.Module):
+    def __init__(self, loss, ignore_index):
+        super().__init__()
+        self.loss, self.ignore_index = loss, ignore_index
+
+    def forward(self, inputs, targets):
+        labels = targets[:, 0] if targets.ndim == 4 else targets
+        valid = labels != self.ignore_index
+        if not valid.any():
+            return inputs.sum() * 0
+        selected = inputs.movedim(1, -1)[valid].T[None, :, None, :]
+        truth = labels[valid][None, None, :]
+        if inputs.shape[1] == 1:
+            truth = truth[:, None].to(inputs.dtype)
+        return self.loss(selected, truth)

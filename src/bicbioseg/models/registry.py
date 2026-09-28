@@ -23,8 +23,62 @@ MODEL_SPECS = {
     "deit": ModelSpec("transformer_segmentation", "DeiTSegmenter", "in_channels", "n_classes", aliases=("deit_seg",)),
     "swin_unet": ModelSpec("transformer_segmentation", "SwinUNet", "in_channels", "n_classes", aliases=("swin", "swinunet")),
     "pvt_unet": ModelSpec("transformer_segmentation", "PVTUNet", "in_channels", "n_classes", aliases=("pvt", "pvtv2")),
+    "pvtformer_full": ModelSpec("pvtformer_full", "PVTFormerFull", "in_channels", "n_classes", aliases=("pvtformer",)),
+    "resunetplusplus_full": ModelSpec("resunetplusplus_full", "ResUNetPlusPlusFull", "in_channels", "n_classes", aliases=("resunetplusplus", "resunet++")),
+    "unext_full": ModelSpec("unext_full", "UNeXtFull", "in_channels", "n_classes", aliases=("unext",)),
+    "swin_unet_full": ModelSpec("swin_unet_full", "SwinUNetFull", "in_channels", "n_classes"),
 }
 MODEL_ALIASES = {alias: name for name, spec in MODEL_SPECS.items() for alias in (name, *spec.aliases)}
+
+
+def model_metadata(name):
+    descriptions = {
+        "unet": "Configurable convolutional U-Net with skip connections.",
+        "attention_unet": "Convolutional U-Net with channel and spatial attention (CBAM).",
+        "double_unet": "Cascaded U-Nets with a torchvision encoder and ASPP.",
+        "transunet": "CNN/ViT hybrid encoder with a convolutional skip decoder.",
+        "segformer": "Hierarchical Mix Transformer with an MLP segmentation decoder.",
+        "deit": "DeiT encoder with a convolutional upsampling decoder.",
+        "swin_unet": "Swin encoder with a convolutional pyramid decoder.",
+        "pvt_unet": "PVTv2 encoder with a convolutional pyramid decoder.",
+        "pvtformer_full": "PVTv2 three-scale encoder with residual hierarchical decoding and full-resolution multiscale fusion.",
+        "resunetplusplus_full": "SE residual U-Net with decoder attention and bridge/output ASPP.",
+        "unext_full": "Convolutional U-Net with shifted token MLP encoder and decoder stages.",
+        "swin_unet_full": "Swin encoder and Swin decoder with patch expansion and skip fusion.",
+    }
+    transformer = name in {"deit", "swin_unet", "pvt_unet", "swin_unet_full", "pvtformer_full"}
+    presets = {
+        "deit": ("tiny", "small", "base"), "swin_unet": ("tiny", "small", "base"),
+        "swin_unet_full": ("tiny", "small", "base"),
+        "pvt_unet": ("b0", "b1", "b2", "b3", "b4", "b5"),
+        "transunet": ("custom", "resnet50"),
+        "pvtformer_full": ("b0", "b1", "b2", "b3", "b4", "b5"),
+        "unext_full": ("base", "small"),
+    }
+    constraints = {
+        "unet": "Spatial dimensions must accommodate 2**num_decoder_blocks downsampling.",
+        "attention_unet": "Spatial dimensions >=16; training BatchNorm needs multiple values per channel.",
+        "double_unet": "RGB binary segmentation only; dimensions divisible by 16, >=32 recommended.",
+        "transunet": "Dimensions divisible by 16; ResNet encoder accepts 1 or 3 channels.",
+        "segformer": "Dimensions >=32 recommended for spatial-reduction attention.",
+        "resunetplusplus_full": "Positive spatial dimensions padded to multiples of 8, minimum 16.",
+        "unext_full": "Padded to multiples of 32; training requires batch * ceil(H/32) * ceil(W/32) > 1 for BatchNorm.",
+    }
+    return {
+        "name": name, "class_name": MODEL_SPECS[name].class_name,
+        "description": descriptions[name], "aliases": list(MODEL_SPECS[name].aliases),
+        "presets": list(presets.get(name, ())),
+        "preset_argument": "encoder_name" if name == "transunet" else ("variant" if transformer or name == "unext_full" else None),
+        "dependencies": ["torch", "timm>=1.0.25,<2"] if transformer else ["torch", "torchvision", "einops"],
+        "install_extra": "bicbioseg[transformers]" if transformer else None,
+        "supported_devices": ["cpu", "cuda", "mps"],
+        "device_notes": "Requires an available PyTorch backend; run validate_setup on the target device.",
+        "input_constraints": "1 or 3 channels; positive spatial dimensions are padded internally." if transformer else constraints[name],
+        "deep_supervision": name in {"swin_unet_full", "pvtformer_full", "resunetplusplus_full", "unext_full"},
+        "pretrained": ("ImageNet encoder only via pretrained=True; decoder starts from scratch." if transformer
+                       else "ResNet-50 encoder via encoder_weights; ViT starts from scratch." if name == "transunet"
+                       else "Torchvision encoder via pretrained=True." if name == "double_unet" else None),
+    }
 
 
 def build_model(name, in_channels, num_classes, image_size, model_kwargs):

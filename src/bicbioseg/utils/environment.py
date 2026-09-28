@@ -42,7 +42,7 @@ def environment_info() -> dict:
 
         info["cuda_available"] = torch.cuda.is_available()
         info["mps_available"] = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
-        info["device_suggestion"] = "cuda" if info["cuda_available"] else "mps" if info["mps_available"] else "cpu"
+        info["device_suggestion"] = "mps" if platform.system() == "Darwin" and info["mps_available"] else "cuda" if info["cuda_available"] else "cpu"
     except ImportError:
         info["cuda_available"] = False
         info["mps_available"] = False

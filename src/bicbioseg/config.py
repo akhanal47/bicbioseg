@@ -68,6 +68,14 @@ class TrainingConfig(SerializableConfig):
     resume_from: Optional[str] = None
     progress_bar: bool = True
     verbose: bool = True
+    precision: str = "fp32"
+    accumulation_steps: int = 1
+    max_grad_norm: Optional[float] = None
+    scheduler: Optional[str] = None
+    scheduler_kwargs: Dict[str, Any] = field(default_factory=dict)
+    aux_loss_weights: Optional[Sequence[float]] = None
+    crop_size: Optional[Tuple[int, int]] = None
+    foreground_probability: float = 0.0
 
 
 @dataclass
@@ -81,6 +89,8 @@ class SegmenterConfig(SerializableConfig):
     device: Optional[str] = None
     model_kwargs: Dict[str, Any] = field(default_factory=dict)
     loss_kwargs: Dict[str, Any] = field(default_factory=dict)
+    normalization: Dict[str, Any] = field(default_factory=lambda: {"mode": "standard"})
+    ignore_index: Optional[int] = None
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]):
@@ -104,6 +114,8 @@ class ExperimentConfig(SerializableConfig):
     model_kwargs: Dict[str, Any] = field(default_factory=dict)
     loss_kwargs: Dict[str, Any] = field(default_factory=dict)
     device: Optional[str] = None
+    normalization: Dict[str, Any] = field(default_factory=lambda: {"mode": "standard"})
+    ignore_index: Optional[int] = None
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]):
@@ -111,3 +123,16 @@ class ExperimentConfig(SerializableConfig):
         if payload.get("image_size") is not None:
             payload["image_size"] = tuple(payload["image_size"])
         return cls(**payload)
+
+
+@dataclass
+class ExperimentRunConfig(SerializableConfig):
+    segmenter: SegmenterConfig = field(default_factory=SegmenterConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    seed: int = 42
+
+    @classmethod
+    def from_dict(cls, payload):
+        return cls(segmenter=SegmenterConfig.from_dict(payload.get("segmenter", {})),
+                   training=TrainingConfig.from_dict(payload.get("training", {})),
+                   seed=payload.get("seed", 42))

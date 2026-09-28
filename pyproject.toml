@@ -21,7 +21,7 @@ dependencies = [
     "pillow",
     "scikit-learn",
     "scipy",
-    "torch",
+    "torch>=2.3",
     "torchvision",
     "tqdm",
 ]
