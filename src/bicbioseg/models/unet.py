@@ -65,7 +65,10 @@ class Up(nn.Module):
         # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
         # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
         x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
+        return self.conv(self._refine_features(x))
+
+    def _refine_features(self, x):
+        return x
 
 
 class OutConv(nn.Module):
@@ -79,6 +82,7 @@ class OutConv(nn.Module):
 
 class UNet(nn.Module):
     MAX_DECODER_BLOCKS = 8
+    UP_BLOCK = Up
     
     def __init__(
         self, 
@@ -150,7 +154,7 @@ class UNet(nn.Module):
             else:
                 out_ch = skip_channels
             
-            self.decoders.append(Up(in_ch_decoder, out_ch, bilinear))
+            self.decoders.append(self.UP_BLOCK(in_ch_decoder, out_ch, bilinear))
             in_ch = out_ch
         
         # out conv
