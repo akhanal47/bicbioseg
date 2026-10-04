@@ -76,6 +76,14 @@ class TrainingConfig(SerializableConfig):
     aux_loss_weights: Optional[Sequence[float]] = None
     crop_size: Optional[Tuple[int, int]] = None
     foreground_probability: float = 0.0
+    checkpoint_interval: Optional[int] = None
+    dataset_id: Optional[str] = None
+
+    def __post_init__(self):
+        if self.crop_size is not None:
+            self.crop_size = tuple(self.crop_size)
+        if self.aux_loss_weights is not None:
+            self.aux_loss_weights = tuple(self.aux_loss_weights)
 
 
 @dataclass
@@ -91,6 +99,28 @@ class SegmenterConfig(SerializableConfig):
     loss_kwargs: Dict[str, Any] = field(default_factory=dict)
     normalization: Dict[str, Any] = field(default_factory=lambda: {"mode": "standard"})
     ignore_index: Optional[int] = None
+    include_background: bool = False
+    metric_aggregation: str = "per_image"
+    empty_policy: str = "exclude"
+    class_map: Optional[Dict[int, str]] = None
+
+    def __post_init__(self):
+        from .models.options import normalize_model_options
+        from .models.registry import MODEL_ALIASES
+
+        self.architecture = MODEL_ALIASES.get(self.architecture.lower(), self.architecture.lower())
+        self.image_size = (
+            (self.image_size, self.image_size) if isinstance(self.image_size, int) else tuple(self.image_size)
+        )
+        if self.class_map is not None:
+            self.class_map = {int(k): str(v) for k, v in self.class_map.items()}
+        self.model_kwargs = normalize_model_options(
+            self.architecture,
+            self.model_kwargs,
+            in_channels=self.in_channels,
+            num_classes=self.num_classes,
+            image_size=self.image_size,
+        )
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]):
@@ -116,6 +146,28 @@ class ExperimentConfig(SerializableConfig):
     device: Optional[str] = None
     normalization: Dict[str, Any] = field(default_factory=lambda: {"mode": "standard"})
     ignore_index: Optional[int] = None
+    include_background: bool = False
+    metric_aggregation: str = "per_image"
+    empty_policy: str = "exclude"
+    class_map: Optional[Dict[int, str]] = None
+
+    def __post_init__(self):
+        from .models.options import normalize_model_options
+        from .models.registry import MODEL_ALIASES
+
+        self.model = MODEL_ALIASES.get(self.model.lower(), self.model.lower())
+        self.image_size = (
+            (self.image_size, self.image_size) if isinstance(self.image_size, int) else tuple(self.image_size)
+        )
+        if self.class_map is not None:
+            self.class_map = {int(k): str(v) for k, v in self.class_map.items()}
+        self.model_kwargs = normalize_model_options(
+            self.model,
+            self.model_kwargs,
+            in_channels=self.in_channels,
+            num_classes=self.num_classes,
+            image_size=self.image_size,
+        )
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]):

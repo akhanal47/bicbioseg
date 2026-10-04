@@ -8,7 +8,7 @@ from einops.layers.torch import Rearrange
 
 
 def cast_tuple(val, depth):
-    return val if isinstance(val, tuple) else (val,) * depth
+    return tuple(val) if isinstance(val, (tuple, list)) else (val,) * depth
 
 class DsConv2d(nn.Module):
     def __init__(self, dim_in, dim_out, kernel_size, padding, stride = 1, bias = True):
