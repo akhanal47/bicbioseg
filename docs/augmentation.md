@@ -2,61 +2,78 @@
 
 [Documentation](README.md) · [Training guide](training.md)
 
-Apply the same geometric transform to each image and mask. Keep validation and test data unchanged.
-Split data before you save augmented copies.
+Generate augmented image and mask files before training. Augmentation remains separate from normalization.
+Split the dataset first. Augment only the training split.
 
 ```python
 from functools import partial
-from bicbioseg import AugmentImages, AugmentationPipeline, Segmenter
+from bicbioseg import AugmentImages, apply_and_save_augmentations
 
-transforms = AugmentationPipeline([
-    partial(AugmentImages.flip, mode="horizontal", probability=0.5),
-    partial(AugmentImages.rotate, angle_range=(-15, 15), probability=0.5),
-])
-model = Segmenter(architecture="unet")
-model.train(data="cell_dataset", transforms=transforms, epochs=50)
+files = apply_and_save_augmentations(
+    images_source="cell_dataset/train/images",
+    masks_source="cell_dataset/train/masks",
+    output_dir="augmented_train",
+    augmentations=[
+        partial(AugmentImages.flip, mode="horizontal", probability=0.5),
+        partial(AugmentImages.rotate, angle_range=(5, 15), probability=0.5),
+    ],
+    num_augmented=3,
+    random_seed=42,
+    preview_to="qc/augmentation.png",
+)
 ```
 
+The output contains paired `images` and `masks` folders. Source stems identify each pair.
+The function returns saved image paths. It preserves uint8 and uint16 images as PNG.
+Normalized floating-point image files use uncompressed TIFF. Masks retain integer class IDs.
+Original files remain in their source folders. Combine source lists explicitly if training should include originals and augmented copies.
+
+## Transform contract
+
 Each transform accepts `(image, mask)` and returns the transformed pair.
-Use `AugmentationPipeline.add(transform)` to append a transform.
+Images are grayscale `HxW` or RGB `HxWx3`, with dtype uint8, uint16, float32, or float64.
+Floating-point images must already be finite and in `[0, 1]`. Augmentation does not apply a normalization policy.
+Masks are integer `HxW` arrays with the same spatial dimensions as the image.
+
+Geometric transforms use nearest-neighbor sampling for masks. Rotation can add background label 0 at image borders.
+Brightness and histogram transforms leave the mask unchanged. Every built-in transform preserves image dtype and range.
+The file writer checks that transforms do not introduce unexpected labels.
 
 | Helper | Options and defaults |
 | --- | --- |
 | `rotate` | `angle_range=(5, 30)`, `resize_target=None`, `probability=1.0` |
-| `flip` | `mode="random"` (`horizontal`/`h`, `vertical`/`v`, `both`/`vh`, or `random`), `probability=1.0` |
+| `flip` | `mode="random"`, `probability=1.0`. Modes: `horizontal`/`h`, `vertical`/`v`, `both`/`vh`, `random`. |
 | `adjust_brightness` | `delta_range=(-30, 30)`, `probability=1.0` |
 | `hist_equalize` | `clipLimit=3`, `tileGridSize=(8, 8)`, `probability=1.0` |
 | `random_crop` | `crop_size=(224, 224)`, `probability=1.0` |
 
-The built-in helpers require uint8 images and masks. Explicit intensity policies produce floats, so use compatible custom transforms for those policies.
-`hist_equalize` expects BGR color arrays. The training loader supplies RGB, so convert color order if you use this helper there.
-`rotate(resize_target=...)` passes its size directly to OpenCV as `(width, height)`.
-For crop sampling before the loader resize, use [TrainingConfig.crop_size](configuration/training.md).
+Resize and crop sizes use `(height, width)`. Brightness deltas use 8-bit units for all image dtypes.
+For example, a delta of 25.5 represents 10% of the dtype's full range.
+Histogram equalization applies CLAHE to RGB luminance. Float and uint16 luminance use a 16-bit working buffer.
 
-## Use Albumentations
-
-Install `bicbioseg[albumentations]`.
+## Preview label preservation
 
 ```python
-from bicbioseg import Segmenter, create_albumentations_pipeline
+import cv2
+from bicbioseg import AugmentImages, AugmentationPipeline
 
-transforms = create_albumentations_pipeline(
-    horizontal_flip=True,
-    vertical_flip=False,
-    rotate_limit=30,
-    brightness_contrast=True,
-    elastic=False,
-    probability=0.5,
-)
-model = Segmenter(architecture="unet")
-model.train(data="cell_dataset", transforms=transforms, epochs=50)
+image = cv2.cvtColor(cv2.imread("cell_dataset/train/images/sample_001.png"), cv2.COLOR_BGR2RGB)
+mask = cv2.imread("cell_dataset/train/masks/sample_001.png", cv2.IMREAD_UNCHANGED)
+pipeline = AugmentationPipeline([AugmentImages.rotate])
+report = pipeline.preview(image, mask, save_to="qc/preview.png")
+print(report["labels_preserved"], report["unexpected_labels"])
 ```
 
-These are the factory defaults. Pass `transforms=[...]` to use your own Albumentations transform list.
-Use `AlbumentationsTransform(compose)` to adapt an existing composition to the paired transform interface.
+The preview shows original and augmented image/mask pairs. Its report lists labels before and after, dtype, and shape consistency.
+`labels_preserved` means that the transform introduced no label IDs except background 0. Cropping can remove an object entirely.
+Use `pipeline.add(transform)` to append a transform.
 
-## Save augmented files
+## Optional Albumentations adapter
 
-`apply_and_save_augmentations` accepts `images_source`, optional `masks_source`, and `output_dir="augmented"`.
-Other options are `augmentations=None`, `num_augmented=1`, `random_seed=None`, and `valid_extensions=(".png", ".jpg", ".jpeg", ".bmp")`.
-Use training sources only. See the [augmentation source](../src/bicbioseg/utils/augmentation.py) for dtype and shape requirements.
+Install `bicbioseg[albumentations]` to use `create_albumentations_pipeline` or `AlbumentationsTransform`.
+The factory defaults are `horizontal_flip=True`, `vertical_flip=False`, `rotate_limit=30`,
+`brightness_contrast=True`, `elastic=False`, and `probability=0.5`.
+Pass `transforms=[...]` for a custom list, or wrap an existing composition with `AlbumentationsTransform(compose)`.
+Check the selected external transforms against the dtype and mask-label contract.
+
+The existing loader transform hook remains available for custom workflows. File generation does not require it.

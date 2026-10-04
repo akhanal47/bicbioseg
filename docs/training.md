@@ -154,3 +154,27 @@ Training keeps the final epoch in memory. Load `best_model.pt` explicitly to pre
 See [all training settings](configuration/training.md) for precision, accumulation, clipping, schedulers, crops, and resume constraints.
 See [normalization](configuration/normalization.md) for uint16 microscopy and ignored labels.
 See [augmentation](augmentation.md) for paired transforms.
+
+## Recover interrupted training
+
+```python
+from bicbioseg import Segmenter
+
+model = Segmenter(architecture="unet")
+model.train(
+    data="cell_dataset", epochs=50, experiment_dir="experiments",
+    run_name="recoverable", checkpoint_interval=1,
+)
+# After an interruption, restore the latest completed epoch.
+model = Segmenter.load("experiments/recoverable/last_model.pt")
+model.train(
+    data="cell_dataset", epochs=10,
+    resume_from="experiments/recoverable/last_model.pt",
+    experiment_dir="experiments", run_name="recoverable", checkpoint_interval=1,
+)
+```
+
+A recovery checkpoint includes optimizer, scheduler, scaler, random states, completed epoch, and dataset identity.
+An atomic write protects the previous checkpoint if a save fails. Resume starts at an epoch boundary.
+For custom datasets, pass a stable `dataset_id` when their content cannot be inspected automatically.
+See [checkpoint provenance](configuration/training.md#checkpoint-provenance) for identity validation and format versions.

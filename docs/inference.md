@@ -119,3 +119,44 @@ Each tile uses the model's `image_size` for the forward pass. Tile logits resize
 
 Ensemble checkpoints must use the same class count and class order.
 `ensemble_predict` averages probabilities. Its options are `save_to`, `threshold=0.5`, `device=None`, and `save_overlay=True`.
+
+## Batch folder prediction and structured results
+
+```python
+from bicbioseg import Segmenter
+
+model = Segmenter.load("experiments/unet_dice/best_model.pt")
+results = model.inference(
+    "new_images", save_to="predictions", batch_size=8,
+    structured=True, return_arrays=True, save_probability=True,
+)
+print(results[0]["paths"]["mask"])
+print(results[0]["metadata"]["threshold"])
+```
+
+`batch_size` defaults to 1. Each image resizes to the configured input size, then its scores return to its original dimensions.
+Folder batches can contain different source image sizes. Duplicate source stems cause an error before outputs are written.
+Ensemble prediction also accepts `batch_size`, `return_arrays`, `save_probability`, and `structured`.
+Ensemble class counts and saved class maps must match.
+
+Set `structured=True` on any prediction method for the shared record format:
+
+| Field | Contents |
+| --- | --- |
+| `source` | Absolute source image path |
+| `shape` | Output mask height and width |
+| `paths` | Saved mask, overlay, probability, logits, or contour paths |
+| `metadata` | Architecture, checkpoint, completed epoch, dataset identity, threshold, class map, and preprocessing settings |
+| `mask` | Mask array when arrays are requested, otherwise `None` |
+| `probability` | Probability array when requested, otherwise `None` |
+| `logits` | Raw scores when available and requested, otherwise `None` |
+
+Folder and ensemble prediction return a list of records. Single-image and tiled prediction return one record.
+`predict_one(structured=True)` includes arrays. Folder, tiled, and ensemble methods use `return_arrays=True` to include arrays.
+Tiled and ensemble records do not provide raw logits. Tiled metadata also records tile settings.
+
+Saved outputs always include a JSON manifest without array contents.
+Folder and ensemble manifests are `predictions.json`. Single-image saves use the mask path with a `.json` suffix.
+Tiled saves use `<source_stem>_prediction.json`.
+Binary manifests retain the selected threshold. Multiclass threshold is `null`, because prediction uses class argmax.
+Set `class_map={0: "background", 1: "cell"}` when creating the model to retain meaningful class names in checkpoints and outputs.

@@ -76,14 +76,16 @@ exp.qc()
 exp.preview(show=True)
 exp.prepare(split=(0.8, 0.1, 0.1), resize=(224, 224))
 exp.train(epochs=50, batch_size=8, num_workers=0, early_stopping=True, patience=10)
-exp.evaluate()
-exp.predict("new_images", save_overlay=True)
+exp.qc(splits=True)
+exp.evaluate(checkpoint="best")
+exp.predict("new_images", checkpoint="best", batch_size=8, save_overlay=True)
 exp.report()
 ```
 
 Review the quality report and preview before training.
 The workflow saves split data, checkpoints, training history, predictions, evaluation scores, and a report.
-`evaluate` and `predict` use the model currently in memory. See [training](docs/training.md) to load the best saved checkpoint.
+Choose `checkpoint="best"`, `"final"`, `"last"`, a checkpoint path, or `"current"` for evaluation and prediction.
+Reports include the selected checkpoint, split, threshold, metrics, and example predictions.
 
 ## Use the components you need
 
@@ -126,10 +128,41 @@ See [model selection](docs/models/README.md) for shared behavior and setup check
 from bicbioseg import Segmenter
 
 model = Segmenter.load("cell_experiment/runs/unet_dice/best_model.pt")
-model.inference("new_images", save_to="predictions", save_overlay=True)
+results = model.inference(
+    "new_images", save_to="predictions", batch_size=8,
+    save_overlay=True, structured=True,
+)
+print(results[0]["paths"]["mask"])
+print(results[0]["metadata"]["class_map"])
 ```
 
 See [inference](docs/inference.md) for single images, tiled prediction, and ensembles.
+
+## Save reusable settings
+
+```python
+from bicbioseg import Segmenter, SegmenterConfig
+
+print(Segmenter.model_options("segformer"))
+config = SegmenterConfig(
+    architecture="segformer",
+    model_kwargs={"dims": [32, 64, 160, 256], "num_layers": [2, 2, 2, 2]},
+)
+config.save("model.json")
+model = Segmenter.from_config(SegmenterConfig.load("model.json"))
+```
+
+Model options are validated before construction. JSON lists are normalized automatically.
+Use [training configuration](docs/configuration/training.md) to save periodic recovery checkpoints.
+
+## Check labels and prepare augmentation
+
+[Color-mask conversion](docs/image-operations.md#convert-color-masks) creates one RGB color map for the dataset and saves it as JSON.
+Quality checks report invalid labels, ignored pixels, and missing classes across splits.
+[Augmentation](docs/augmentation.md) saves paired files separately from normalization and provides previews that check mask labels.
+
+Evaluation excludes empty class comparisons by default. Images containing only ignored labels never contribute to scores.
+Select per-image or dataset-wide aggregation in the [evaluation guide](docs/evaluation.md).
 
 ## Continue with your task
 

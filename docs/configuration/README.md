@@ -31,7 +31,8 @@ restored = TrainingConfig.load("training.json")
 
 Configuration files contain settings. Checkpoints contain trained model state.
 Use JSON-compatible values when you save settings. Custom functions, transforms, and optimizer objects require Python setup.
-SegFormer's stage-specific options require tuples. Convert JSON lists to tuples before you construct that model.
+Model configurations validate architecture options and normalize JSON sequences automatically, including SegFormer stage settings.
+`Segmenter.model_options(name)` lists option types, defaults, constraints, and accepted choices without constructing a model.
 
 Dataset preparation and model settings use `(height, width)` for `resize`, `image_size`, `crop_size`, and `patch_size`.
 The TIFF conversion helper also accepts `(height, width)`.
