@@ -1,5 +1,9 @@
 .DS*
 .pytest_cache/
+benchmark-data/
+benchmark-results/
+benchmarks/
+paper/
 **/__pycache__/
 **/*.py[cod]
 **/*$py.class
@@ -213,3 +217,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+tests/test_hardware_benchmark.py
