@@ -35,6 +35,8 @@ MODEL_ALIASES = {alias: name for name, spec in MODEL_SPECS.items() for alias in 
 
 
 def model_metadata(name):
+    from .options import model_options
+
     descriptions = {
         "unet": "Configurable convolutional U-Net with skip connections.",
         "cattention_unet": "Configurable CAttention U-Net with CBAM after skip concatenation in each decoder stage.",
@@ -68,19 +70,37 @@ def model_metadata(name):
         "unext_full": "Padded to multiples of 32; training requires batch * ceil(H/32) * ceil(W/32) > 1 for BatchNorm.",
     }
     return {
-        "name": name, "class_name": MODEL_SPECS[name].class_name,
-        "description": descriptions[name], "aliases": list(MODEL_SPECS[name].aliases),
+        "name": name,
+        "class_name": MODEL_SPECS[name].class_name,
+        "options": model_options(name),
+        "description": descriptions[name],
+        "aliases": list(MODEL_SPECS[name].aliases),
         "presets": list(presets.get(name, ())),
-        "preset_argument": "encoder_name" if name == "transunet" else ("variant" if transformer or name == "unext_full" else None),
+        "preset_argument": (
+            "encoder_name"
+            if name == "transunet"
+            else ("variant" if transformer or name == "unext_full" else None)
+        ),
         "dependencies": ["torch", "timm>=1.0.25,<2"] if transformer else ["torch", "torchvision", "einops"],
         "install_extra": "bicbioseg[transformers]" if transformer else None,
         "supported_devices": ["cpu", "cuda", "mps"],
         "device_notes": "Requires an available PyTorch backend; run validate_setup on the target device.",
-        "input_constraints": "1 or 3 channels; positive spatial dimensions are padded internally." if transformer else constraints[name],
-        "deep_supervision": name in {"swin_unet_full", "pvtformer_full", "resunetplusplus_full", "unext_full"},
-        "pretrained": ("ImageNet encoder only via pretrained=True; decoder starts from scratch." if transformer
-                       else "ResNet-50 encoder via encoder_weights; ViT starts from scratch." if name == "transunet"
-                       else "Torchvision encoder via pretrained=True." if name == "double_unet" else None),
+        "input_constraints": (
+            "1 or 3 channels; positive spatial dimensions are padded internally."
+            if transformer
+            else constraints[name]
+        ),
+        "deep_supervision": name
+        in {"swin_unet_full", "pvtformer_full", "resunetplusplus_full", "unext_full"},
+        "pretrained": (
+            "ImageNet encoder only via pretrained=True; decoder starts from scratch."
+            if transformer
+            else (
+                "ResNet-50 encoder via encoder_weights; ViT starts from scratch."
+                if name == "transunet"
+                else "Torchvision encoder via pretrained=True." if name == "double_unet" else None
+            )
+        ),
     }
 
 

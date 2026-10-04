@@ -52,6 +52,7 @@ See [shared settings](../configuration/segmenter.md) and [losses](../configurati
 from bicbioseg import Segmenter
 
 print(Segmenter.available_models())
+print(Segmenter.model_options("transunet"))
 print(Segmenter.available_models(detailed=True)["transunet"])
 print(Segmenter.available_devices())
 
@@ -77,3 +78,6 @@ See [auxiliary loss weights](../configuration/training.md).
 
 Use [`Segmenter.save()` and `Segmenter.load()`](../training.md) to retain the model configuration.
 Restoring an optional transformer model still requires `timm`, but does not download initialization weights again.
+
+`model_options` returns a copy of each option schema with its default, type, description, and constraints.
+Detailed model discovery includes the same schema under `options`. Unknown options fail before model construction or weight downloads.

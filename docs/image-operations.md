@@ -87,17 +87,20 @@ measurements = ImageOps.measure_objects(
 
 ## Convert color masks
 
-Use one explicit color map for the entire dataset. Automatic maps can assign different IDs when images contain different colors.
-Color tuple order must match the input array. OpenCV reads BGR arrays by default.
+Folder conversion discovers colors across all masks before it assigns class IDs.
+It saves the shared RGB map as `class_map.json` and writes `conversion.json` with source paths and unknown-color details.
+Array conversion expects RGB. Convert OpenCV BGR input before calling it.
 
 ```python
 import cv2
 from bicbioseg import ImageOps
 
-color_mask = cv2.imread("raw/color_masks/sample_001.png")
+color_mask = cv2.cvtColor(
+    cv2.imread("raw/color_masks/sample_001.png"), cv2.COLOR_BGR2RGB,
+)
 labels, color_map = ImageOps.convert_color_mask_to_labels(
     color_mask,
-    color_map={(0, 0, 0): 0, (0, 0, 255): 1, (0, 255, 0): 2},
+    color_map={(0, 0, 0): 0, (255, 0, 0): 1, (0, 255, 0): 2},
 )
 cv2.imwrite("sample_001_labels.png", labels)
 ```
@@ -135,3 +138,39 @@ The conversion produces 8-bit images.
 The postprocessing example expects a binary NumPy mask. Process each class separately for multiclass masks.
 Object measurements include area, perimeter, centroid, bounding box, and optional mean image intensity.
 See the [image operations source](../src/bicbioseg/imageops/preprocess.py) for helper signatures.
+
+## Reuse a dataset color map
+
+```python
+from bicbioseg import ImageOps
+
+ImageOps.normalize_masks("raw/color_masks", "labels", mode="color")
+ImageOps.normalize_masks(
+    "new/color_masks", "new_labels", mode="color",
+    color_map="labels/class_map.json",
+)
+```
+
+Unknown colors raise `DatasetError` by default. They cannot silently become background.
+To allow them, choose `unknown_color="background"` or `unknown_color="ignore", ignore_index=255`.
+Both explicit fallback policies emit a warning. Choose an ignored ID that is not a valid class.
+Use `ImageOps.save_color_map(mapping, path)` and `ImageOps.load_color_map(path)` to manage maps directly.
+Label mode preserves integer bit depth, including uint16 class IDs.
+
+## Check label validity and split coverage
+
+```python
+from bicbioseg import ImageOps
+
+report = ImageOps.dataset_qc_report(
+    "raw/images", "raw/masks", num_classes=3, ignore_index=255,
+)
+coverage = ImageOps.dataset_split_qc_report(
+    "cell_dataset", num_classes=3, ignore_index=255, save_to="qc/splits.json",
+)
+```
+
+Reports include invalid labels, mismatched shapes, ignored-only masks, ignored pixel counts, and per-class sample/pixel counts.
+Color masks are reported as non-label masks. Convert them before training.
+Split reports list missing classes separately for `train`, `validate`, and `test`.
+`exp.qc(splits=True)` checks the prepared experiment dataset with the model's class and ignored-label settings.

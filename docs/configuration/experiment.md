@@ -37,6 +37,10 @@ exp = SegmentationExperiment.from_config("cell_experiment.json")
 | `device` | `None` | `None` or `auto` selects CUDA, then MPS, then CPU. Explicit choices include `cpu`, `mps`, `cuda`, and `cuda:1`. |
 | `normalization` | `{"mode": "standard"}` | Image scaling policy shared by training and inference. See [normalization](normalization.md). |
 | `ignore_index` | `None` | Optional integer label to exclude from losses and metrics. Set it here to keep both consistent. |
+| `include_background` | `False` | Include class 0 in multiclass metric averages during training and evaluation. |
+| `metric_aggregation` | `'per_image'` | Average valid image scores, or use `'dataset'` to pool confusion counts. |
+| `empty_policy` | `'exclude'` | Empty class comparisons: `'exclude'`, `'zero'`, or `'one'`. Ignored-only samples are always excluded. |
+| `class_map` | `None` | Class ID to unique name. Supply all IDs, including background. Defaults to generated names. |
 
 Dataset split and training settings use separate [DatasetSplitConfig](dataset.md) and [TrainingConfig](training.md) objects.
 Pass them to `exp.prepare` and `exp.train`.
@@ -66,3 +70,17 @@ predictions/   predictions for new images
 `exp.evaluate()` uses the test split by default. Pass `split="validate"` to use validation data.
 `exp.predict(images)` accepts the folder inference options in the [prediction guide](../inference.md).
 `exp.report()` writes a report for the run. `exp.segmenter` exposes the underlying model wrapper.
+
+Class-map keys normalize from JSON strings to integers. Binary models use IDs 0 and 1.
+Color-to-label conversion uses a separate RGB `color_map`, described in [image operations](../image-operations.md).
+
+## Select saved weights and report artifacts
+
+Use `exp.evaluate(checkpoint="best")` or `exp.predict(images, checkpoint="final")`.
+Accepted choices are `current` (default), `best`, `final`, `last`, or an explicit checkpoint path.
+A selected checkpoint loads separately. It does not replace `exp.segmenter`.
+Missing checkpoints cause an explicit error.
+
+The workflow records output directories in `work_dir/artifacts.json`, including custom `save_to` locations.
+`exp.report(save_to=None)` reads those locations and links examples relative to the report file.
+The report includes the checkpoint, completed epoch, split, threshold, metric policy, scores, and class support.

@@ -74,6 +74,7 @@ def _match_image_mask_pairs(
     images_source: Source,
     masks_source: Source,
     valid_extensions=VALID_IMAGE_EXTENSIONS,
+    strict=True,
 ) -> List[Tuple[str, str]]:
     images = _load_file_paths(images_source, valid_extensions)
     masks = _load_file_paths(masks_source, valid_extensions)
@@ -102,7 +103,7 @@ def _match_image_mask_pairs(
     if duplicate_masks:
         raise DatasetError(f"Duplicate masks found for stems: {duplicate_masks[:5]}")
 
-    if missing:
+    if missing and strict:
         raise DatasetError(
             "Could not find corresponding masks for: "
             + ", ".join(Path(path).name for path in missing[:5])
@@ -344,37 +345,71 @@ class ImageOps:
         raise ValueError("mode must be 'binary', 'labels', or 'color'.")
 
     @staticmethod
+    def save_color_map(color_map, path):
+        """Save RGB colors and class IDs in a reusable JSON format."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "color_order": "RGB",
+            "colors": [
+                {"color": [int(v) for v in color], "label": int(label)}
+                for color, label in sorted(color_map.items())
+            ],
+        }
+        path.write_text(json.dumps(payload, indent=2))
+        return str(path.resolve())
+
+    @staticmethod
+    def load_color_map(path):
+        payload = json.loads(Path(path).read_text())
+        if payload.get("color_order") != "RGB":
+            raise ValueError("Color maps must declare color_order=RGB.")
+        return {tuple(row["color"]): row["label"] for row in payload["colors"]}
+
+    @staticmethod
     def convert_color_mask_to_labels(
         mask: np.ndarray,
-        color_map: Optional[Mapping[Tuple[int, int, int], int]] = None,
-        background_color: Tuple[int, int, int] = (0, 0, 0),
-    ) -> Tuple[np.ndarray, Dict[Tuple[int, int, int], int]]:
-
-        # convert an RGB/BGR color-coded mask to integer label IDs.
-        if mask.ndim != 3 or mask.shape[2] < 3:
-            raise ValueError("Color mask must have shape (height, width, channels).")
-
-        rgb_mask = mask[:, :, :3]
-        unique_colors = np.unique(rgb_mask.reshape(-1, 3), axis=0)
-
+        color_map=None,
+        background_color=(0, 0, 0),
+        unknown_color="error",
+        ignore_index=None,
+    ):
+        """Convert an RGB mask. Unknown colors raise unless an explicit policy is selected."""
+        if mask.ndim != 3 or mask.shape[2] != 3 or mask.dtype != np.uint8:
+            raise ValueError("Color masks must be uint8 RGB arrays with shape HxWx3.")
+        if unknown_color not in {"error", "background", "ignore"}:
+            raise ValueError("unknown_color must be error, background, or ignore.")
+        if unknown_color == "ignore" and (
+            not isinstance(ignore_index, int) or not 0 <= ignore_index <= 65535
+        ):
+            raise ValueError("unknown_color=ignore requires ignore_index in [0, 65535].")
+        colors = [tuple(int(v) for v in c) for c in np.unique(mask.reshape(-1, 3), axis=0)]
+        if isinstance(color_map, (str, Path)):
+            color_map = ImageOps.load_color_map(color_map)
         if color_map is None:
-            color_map = {}
-            next_label = 1
-            for color in unique_colors:
-                color_tuple = tuple(int(value) for value in color)
-                if color_tuple == background_color:
-                    color_map[color_tuple] = 0
-                else:
-                    color_map[color_tuple] = next_label
-                    next_label += 1
-        else:
-            color_map = {tuple(key): int(value) for key, value in color_map.items()}
-
-        labels = np.zeros(mask.shape[:2], dtype=np.uint16)
+            foreground = [c for c in colors if c != tuple(background_color)]
+            color_map = {tuple(background_color): 0, **{c: i + 1 for i, c in enumerate(foreground)}}
+        color_map = dict(color_map)
         for color, label in color_map.items():
-            labels[np.all(rgb_mask == np.array(color, dtype=rgb_mask.dtype), axis=-1)] = label
-
-        return labels, dict(color_map)
+            if len(color) != 3 or any(
+                not isinstance(v, (int, np.integer)) or not 0 <= v <= 255 for v in color
+            ):
+                raise ValueError("Color keys must contain three RGB integers in [0, 255].")
+            if isinstance(label, bool) or not isinstance(label, (int, np.integer)) or not 0 <= label <= 65535:
+                raise ValueError("Color labels must be integers in [0, 65535].")
+        if unknown_color == "ignore" and ignore_index in color_map.values():
+            raise ValueError("ignore_index must not be a valid class in color_map.")
+        unknown = sorted(set(colors) - set(color_map))
+        if unknown:
+            message = f"Unknown RGB mask colors: {unknown}"
+            if unknown_color == "error":
+                raise DatasetError(message)
+            warnings.warn(message + f". Applying explicit {unknown_color} policy.", UserWarning)
+        fill = ignore_index if unknown_color == "ignore" else 0
+        labels = np.full(mask.shape[:2], fill, dtype=np.uint16)
+        for color, label in color_map.items():
+            labels[np.all(mask == np.asarray(color, dtype=mask.dtype), axis=-1)] = label
+        return labels, color_map
 
     @staticmethod
     def normalize_masks(
@@ -383,24 +418,42 @@ class ImageOps:
         mode: str = "binary",
         threshold: int = 0,
         foreground_value: int = 1,
-        color_map: Optional[Mapping[Tuple[int, int, int], int]] = None,
+        color_map=None,
         overwrite: bool = False,
+        unknown_color="error",
+        ignore_index=None,
     ) -> str:
-        output_path = _prepare_output_dir(output_dir, overwrite)
         mask_paths = _load_file_paths(masks_source)
-        learned_color_map = None
-
+        if any(Path(path).resolve().is_relative_to(Path(output_dir).resolve()) for path in mask_paths):
+            raise DatasetError("Mask output must not contain source masks.")
+        if isinstance(color_map, (str, Path)):
+            color_map = ImageOps.load_color_map(color_map)
+        # Discover all colors before assigning IDs, independent of file order.
+        if mode == "color" and color_map is None:
+            colors = set()
+            for path in mask_paths:
+                mask = cv2.imread(path, cv2.IMREAD_COLOR)
+                if mask is None:
+                    raise DatasetError(f"Could not read mask: {path}")
+                rgb = cv2.cvtColor(mask, cv2.COLOR_BGR2RGB)
+                colors.update(tuple(int(v) for v in c) for c in np.unique(rgb.reshape(-1, 3), axis=0))
+            color_map = {(0, 0, 0): 0, **{c: i + 1 for i, c in enumerate(sorted(colors - {(0, 0, 0)}))}}
+        output_path = _prepare_output_dir(output_dir, overwrite)
+        if mode == "color":
+            ImageOps.save_color_map(color_map, output_path / "class_map.json")
+        conversion = []
         for mask_path in mask_paths:
-            read_mode = cv2.IMREAD_COLOR if mode == "color" else cv2.IMREAD_UNCHANGED
-            mask = cv2.imread(mask_path, read_mode)
+            mask = cv2.imread(mask_path, cv2.IMREAD_COLOR if mode == "color" else cv2.IMREAD_UNCHANGED)
             if mask is None:
-                warnings.warn(f"Could not read mask {mask_path}. Skipping.")
-                continue
-
+                raise DatasetError(f"Could not read mask: {mask_path}")
+            unknown = []
             if mode == "color":
-                normalized, learned_color_map = ImageOps.convert_color_mask_to_labels(
-                    mask,
-                    color_map=color_map or learned_color_map,
+                mask = cv2.cvtColor(mask, cv2.COLOR_BGR2RGB)
+                unknown = sorted(
+                    set(map(tuple, np.unique(mask.reshape(-1, 3), axis=0).tolist())) - set(color_map)
+                )
+                normalized, _ = ImageOps.convert_color_mask_to_labels(
+                    mask, color_map, unknown_color=unknown_color, ignore_index=ignore_index
                 )
             else:
                 normalized = ImageOps.normalize_mask(
@@ -408,10 +461,21 @@ class ImageOps:
                     mode=mode,
                     threshold=threshold,
                     foreground_value=foreground_value,
+                    dtype=mask.dtype if mode == "labels" else np.uint8,
                 )
-
             cv2.imwrite(str(output_path / f"{Path(mask_path).stem}.png"), normalized)
-
+            conversion.append({"source": str(mask_path), "unknown_colors": unknown})
+        (output_path / "conversion.json").write_text(
+            json.dumps(
+                {
+                    "mode": mode,
+                    "unknown_color": unknown_color,
+                    "ignore_index": ignore_index,
+                    "files": conversion,
+                },
+                indent=2,
+            )
+        )
         return str(output_path.resolve())
 
     @staticmethod
@@ -500,8 +564,10 @@ class ImageOps:
         images: Source,
         masks: Source,
         save_to: Optional[PathLike] = None,
+        num_classes: Optional[int] = None,
+        ignore_index: Optional[int] = None,
     ) -> Dict[str, object]:
-        pairs = _match_image_mask_pairs(images, masks)
+        pairs = _match_image_mask_pairs(images, masks, strict=False)
         unmatched = ImageOps.find_unmatched_masks(images, masks)
         image_shapes: Dict[str, int] = defaultdict(int)
         mask_shapes: Dict[str, int] = defaultdict(int)
@@ -510,6 +576,13 @@ class ImageOps:
         foreground_percentages = []
         unreadable_images = []
         unreadable_masks = []
+        invalid_labels, shape_mismatches, ignored_only, non_label_masks = [], [], [], []
+        class_pixels, class_samples = defaultdict(int), defaultdict(int)
+        ignored_pixels = 0
+        if num_classes is not None and (
+            isinstance(num_classes, bool) or not isinstance(num_classes, int) or num_classes < 1
+        ):
+            raise ValueError("num_classes must be a positive integer.")
 
         for image_path, mask_path in pairs:
             image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
@@ -522,25 +595,58 @@ class ImageOps:
                 unreadable_masks.append(mask_path)
                 continue
 
+            if image.shape[:2] != mask.shape[:2]:
+                shape_mismatches.append(Path(mask_path).name)
             image_shapes[str(image.shape)] += 1
             mask_shapes[str(mask.shape)] += 1
 
-            if mask.ndim == 3:
-                mask_for_stats = cv2.cvtColor(mask[:, :, :3], cv2.COLOR_BGR2GRAY)
-            else:
-                mask_for_stats = mask
+            if mask.ndim != 2:
+                non_label_masks.append(Path(mask_path).name)
+                continue
+            mask_for_stats = mask
 
-            values = np.unique(mask_for_stats)
+            valid = (
+                mask_for_stats != ignore_index
+                if ignore_index is not None
+                else np.ones(mask_for_stats.shape, dtype=bool)
+            )
+            ignored_pixels += int((~valid).sum())
+            labels = mask_for_stats[valid]
+            if not labels.size:
+                ignored_only.append(Path(mask_path).name)
+                continue
+            values, counts = np.unique(labels, return_counts=True)
+            bad = values[(values < 0) | (values != np.floor(values))]
+            if num_classes is not None and num_classes > 1:
+                bad = np.unique(np.concatenate((bad, values[values >= num_classes])))
+            if len(bad):
+                invalid_labels.append({"mask": Path(mask_path).name, "labels": bad.tolist()})
+            for value, count in zip(values, counts):
+                label = int(value > 0) if num_classes == 1 else int(value)
+                class_pixels[label] += int(count)
+            for label in set(int(v > 0) if num_classes == 1 else int(v) for v in values):
+                class_samples[label] += 1
             for value in values:
                 mask_values.add(int(value))
 
-            foreground_fraction = float(np.count_nonzero(mask_for_stats) / mask_for_stats.size)
+            foreground_fraction = float(np.count_nonzero(labels) / labels.size)
             foreground_percentages.append(foreground_fraction * 100)
             if foreground_fraction == 0:
                 empty_masks.append(mask_path)
 
         report = {
             "num_pairs": len(pairs),
+            "num_classes": num_classes,
+            "ignore_index": ignore_index,
+            "ignored_pixels": ignored_pixels,
+            "ignored_only_masks": ignored_only,
+            "invalid_labels": invalid_labels,
+            "shape_mismatches": shape_mismatches,
+            "non_label_masks": non_label_masks,
+            "class_support": {
+                str(k): {"pixels": class_pixels[k], "samples": class_samples[k]}
+                for k in sorted(set(class_pixels) | set(range(2 if num_classes == 1 else num_classes or 0)))
+            },
             "unmatched": unmatched,
             "image_shapes": dict(image_shapes),
             "mask_shapes": dict(mask_shapes),
@@ -567,8 +673,43 @@ class ImageOps:
         return report
 
     @staticmethod
+    def dataset_split_qc_report(dataset, num_classes, ignore_index=None, save_to=None):
+        """Inspect train/validate/test label coverage with the same class contract."""
+        reports = {}
+        for split in ("train", "validate", "test"):
+            root = Path(dataset) / split
+            if (root / "images").is_dir() and (root / "masks").is_dir():
+                reports[split] = ImageOps.dataset_qc_report(
+                    root / "images", root / "masks", num_classes=num_classes, ignore_index=ignore_index
+                )
+        missing = {
+            split: [int(k) for k, v in report["class_support"].items() if v["pixels"] == 0]
+            for split, report in reports.items()
+        }
+        report = {
+            "splits": reports,
+            "missing_classes": missing,
+            "warnings": [
+                f"{split}: classes absent: {classes}" for split, classes in missing.items() if classes
+            ],
+        }
+        if save_to is not None:
+            path = Path(save_to)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(report, indent=2))
+        return report
+
+    @staticmethod
     def dataset_warnings(report: Mapping[str, object]) -> List[str]:
         messages = []
+        for key, description in (
+            ("invalid_labels", "masks contain out-of-range labels"),
+            ("shape_mismatches", "image/mask shapes differ"),
+            ("ignored_only_masks", "masks contain only ignored pixels"),
+            ("non_label_masks", "masks are not two-dimensional class labels"),
+        ):
+            if report.get(key):
+                messages.append(f"{len(report[key])} {description}.")
         unmatched = report.get("unmatched", {})
         if unmatched.get("images_without_masks"):
             messages.append(f"{len(unmatched['images_without_masks'])} image(s) do not have matching masks.")

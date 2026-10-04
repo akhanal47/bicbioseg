@@ -2,8 +2,6 @@ import random
 from scipy import ndimage
 import numpy as np
 import cv2
-from torchvision import transforms
-from PIL import Image
 import os
 import glob
 from pathlib import Path
@@ -11,132 +9,164 @@ from pathlib import Path
 class AugmentImages:
     @staticmethod
     def _check_type(img, mask):
-        assert img.dtype == 'uint8', "Image must be uint8"
-        if mask is not None:
-             assert mask.dtype == 'uint8', "Mask must be uint8"
+        if img.dtype not in (np.uint8, np.uint16, np.float32, np.float64):
+            raise ValueError("Images must be uint8, uint16, or normalized float arrays.")
+        if img.ndim not in (2, 3) or (img.ndim == 3 and img.shape[-1] != 3):
+            raise ValueError("Images must be grayscale HxW or RGB HxWx3.")
+        if not np.isfinite(img).all() or not img.size:
+            raise ValueError("Images must be nonempty and finite.")
+        if np.issubdtype(img.dtype, np.floating) and (img.min() < 0 or img.max() > 1):
+            raise ValueError("Float images must already lie in [0, 1].")
+        if mask is not None and (
+            mask.ndim != 2 or mask.shape != img.shape[:2] or not np.issubdtype(mask.dtype, np.integer)
+        ):
+            raise ValueError("Masks must be integer HxW class IDs matching the image.")
 
     @staticmethod
-    def rotate(image: np.ndarray, mask: np.ndarray = None, angle_range=(5, 30), resize_target=None, probability=1.0):
-        if random.random() > probability:
-            return image, mask
-            
-        AugmentImages._check_type(image, mask)
-        
-        angle = random.randint(angle_range[0], angle_range[1])
-        if random.random() > 0.5: 
-            angle = -angle
-
-        def _apply_rot(img, is_mask=False):
-            if resize_target:
-                h, w = img.shape[:2]
-                M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1)
-                interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_CUBIC
-                return cv2.warpAffine(img, M, (w, h), flags=interp)
-            else:
-                return ndimage.rotate(img, angle, reshape=False, order=0 if is_mask else 3)
-
-        aug_img = _apply_rot(image, is_mask=False)
-        aug_mask = _apply_rot(mask, is_mask=True) if mask is not None else None
-        
-        if resize_target:
-            aug_img = cv2.resize(aug_img, resize_target, interpolation=cv2.INTER_CUBIC)
-            if aug_mask is not None:
-                aug_mask = cv2.resize(aug_mask, resize_target, interpolation=cv2.INTER_NEAREST)
-
-        return aug_img, aug_mask
+    def _maximum(image):
+        return float(np.iinfo(image.dtype).max) if np.issubdtype(image.dtype, np.integer) else 1.0
 
     @staticmethod
-    def flip(image: np.ndarray, mask: np.ndarray = None, mode='random', probability=1.0):
-        if random.random() > probability:
-            return image, mask
-            
-        AugmentImages._check_type(image, mask)
-        
-        if mode == 'random':
-            flip_code = random.choice([-1, 0, 1])
-        elif mode in ['v', 'vertical']:
-            flip_code = 0
-        elif mode in ['h', 'horizontal']:
-            flip_code = 1
-        elif mode in ['vh', 'both']:
-            flip_code = -1
-        else:
-            raise ValueError(f"Unknown flip mode: {mode}. Use 'random', 'v', 'h', or 'vh'.")
-
-        aug_img = cv2.flip(image, flip_code)
-        aug_mask = cv2.flip(mask, flip_code) if mask is not None else None
-        
-        return aug_img, aug_mask
+    def _restore(array, image):
+        return np.clip(array, 0, AugmentImages._maximum(image)).astype(image.dtype)
 
     @staticmethod
-    def adjust_brightness(image: np.ndarray, mask: np.ndarray = None, delta_range=(-30, 30), probability=1.0):
+    def rotate(image, mask=None, angle_range=(5, 30), resize_target=None, probability=1.0):
+        AugmentImages._check_type(image, mask)
         if random.random() > probability:
             return image, mask
-            
-        AugmentImages._check_type(image, mask)
-        
-        delta = random.randint(delta_range[0], delta_range[1])
-        new_image = image.astype(np.int16) + delta
-        new_image = np.clip(new_image, 0, 255).astype(np.uint8)
-        
-        return new_image, mask
+        angle = random.uniform(*angle_range) * random.choice((-1, 1))
+        result = AugmentImages._restore(
+            ndimage.rotate(image, angle, axes=(0, 1), reshape=False, order=3), image
+        )
+        labels = (
+            ndimage.rotate(mask, angle, reshape=False, order=0, prefilter=False) if mask is not None else None
+        )
+        if resize_target is not None:
+            height, width = resize_target
+            result = AugmentImages._restore(
+                cv2.resize(result, (width, height), interpolation=cv2.INTER_CUBIC), image
+            )
+            if labels is not None:
+                labels = cv2.resize(
+                    labels.astype(np.float64), (width, height), interpolation=cv2.INTER_NEAREST
+                ).astype(mask.dtype)
+        return result, labels
 
     @staticmethod
-    def hist_equalize(image: np.ndarray, mask: np.ndarray = None, clipLimit=3, tileGridSize=(8,8), probability=1.0):
+    def flip(image, mask=None, mode="random", probability=1.0):
+        AugmentImages._check_type(image, mask)
+        modes = {"h": 1, "horizontal": 1, "v": 0, "vertical": 0, "vh": (0, 1), "both": (0, 1)}
+        if mode != "random" and mode not in modes:
+            raise ValueError("flip mode must be horizontal/h, vertical/v, both/vh, or random.")
         if random.random() > probability:
             return image, mask
-            
-        AugmentImages._check_type(image, mask)
-        
-        # grayscale -> direct apply, else YCrCb then apply
-        if image.ndim == 2:
-            clahe = cv2.createCLAHE(clipLimit=clipLimit, tileGridSize=tileGridSize)
-            equalized = clahe.apply(image)
-        else:
-            converted_img = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
-            clahe = cv2.createCLAHE(clipLimit=clipLimit, tileGridSize=tileGridSize)
-            converted_img[:,:,0] = clahe.apply(converted_img[:,:,0])
-            equalized = cv2.cvtColor(converted_img, cv2.COLOR_YCrCb2BGR)
-            
-        return equalized, mask
+        axis = random.choice((0, 1, (0, 1))) if mode == "random" else modes[mode]
+        return np.flip(image, axis=axis).copy(), np.flip(mask, axis=axis).copy() if mask is not None else None
 
     @staticmethod
-    def random_crop(image: np.ndarray, mask: np.ndarray = None, crop_size=(224, 224), probability=1.0):
+    def adjust_brightness(image, mask=None, delta_range=(-30, 30), probability=1.0):
+        AugmentImages._check_type(image, mask)
         if random.random() > probability:
             return image, mask
-            
+        # Delta is in 8-bit units for all dtypes: 255 means the full intensity range.
+        delta = random.uniform(*delta_range) / 255 * AugmentImages._maximum(image)
+        return AugmentImages._restore(image.astype(np.float64) + delta, image), mask
+
+    @staticmethod
+    def hist_equalize(image, mask=None, clipLimit=3, tileGridSize=(8, 8), probability=1.0):
         AugmentImages._check_type(image, mask)
-        
+        if random.random() > probability:
+            return image, mask
+        maximum = AugmentImages._maximum(image)
+        normalized = image.astype(np.float32) / maximum
+        color = cv2.cvtColor(normalized, cv2.COLOR_RGB2YCrCb) if image.ndim == 3 else None
+        luminance = color[..., 0] if color is not None else normalized
+        bits = 255 if image.dtype == np.uint8 else 65535
+        quantized = np.rint(np.clip(luminance, 0, 1) * bits).astype(np.uint8 if bits == 255 else np.uint16)
+        equalized = (
+            cv2.createCLAHE(clipLimit=clipLimit, tileGridSize=tileGridSize)
+            .apply(quantized)
+            .astype(np.float32)
+            / bits
+        )
+        if color is not None:
+            color[..., 0] = equalized
+            equalized = cv2.cvtColor(color, cv2.COLOR_YCrCb2RGB)
+        return AugmentImages._restore(equalized * maximum, image), mask
+
+    @staticmethod
+    def random_crop(image, mask=None, crop_size=(224, 224), probability=1.0):
+        AugmentImages._check_type(image, mask)
+        if len(crop_size) != 2 or any(not isinstance(v, int) or v < 1 for v in crop_size):
+            raise ValueError("crop_size must contain two positive integers.")
+        if random.random() > probability:
+            return image, mask
         h, w = image.shape[:2]
-        crop_h, crop_w = crop_size
-        
-        if h < crop_h or w < crop_w:
-            img_resized = cv2.resize(image, (crop_w, crop_h), interpolation=cv2.INTER_CUBIC)
-            mask_resized = None
-            if mask is not None:
-                mask_resized = cv2.resize(mask, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
-            return img_resized, mask_resized
+        ch, cw = crop_size
+        if h < ch or w < cw:
+            result = AugmentImages._restore(cv2.resize(image, (cw, ch), interpolation=cv2.INTER_CUBIC), image)
+            labels = (
+                cv2.resize(mask.astype(np.float64), (cw, ch), interpolation=cv2.INTER_NEAREST).astype(
+                    mask.dtype
+                )
+                if mask is not None
+                else None
+            )
+            return result, labels
+        y, x = random.randint(0, h - ch), random.randint(0, w - cw)
+        return image[y : y + ch, x : x + cw].copy(), (
+            mask[y : y + ch, x : x + cw].copy() if mask is not None else None
+        )
 
-        top = random.randint(0, h - crop_h)
-        left = random.randint(0, w - crop_w)
-        
-        img_crop = image[top:top+crop_h, left:left+crop_w]
-        
-        mask_crop = None
-        if mask is not None:
-            mask_crop = mask[top:top+crop_h, left:left+crop_w]
-            
-        return img_crop, mask_crop
 
 class AugmentationPipeline:
     def __init__(self, augmentations=None):
         self.augmentations = augmentations if augmentations is not None else []
-    
+
     def __call__(self, image, mask):
         for aug_func in self.augmentations:
             image, mask = aug_func(image, mask)
         return image, mask
-    
+
+    def preview(self, image, mask, save_to=None, show=False):
+        """Preview a paired transform and report whether it introduced new labels."""
+        import matplotlib.pyplot as plt
+
+        AugmentImages._check_type(image, mask)
+        output, labels = self(image.copy(), mask.copy())
+        before = np.unique(mask).tolist()
+        after = np.unique(labels).tolist()
+        unexpected = sorted(set(after) - set(before) - {0})
+        valid = not unexpected and np.issubdtype(labels.dtype, np.integer)
+        fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+        for axis, array, title in zip(
+            axes.flat,
+            (image, mask, output, labels),
+            ("Original RGB image", "Original labels", "Augmented RGB image", f"Labels preserved: {valid}"),
+        ):
+            display = array / AugmentImages._maximum(array) if array.ndim == 3 else array
+            axis.imshow(display, cmap="gray" if array.ndim == 2 else None, interpolation="nearest")
+            axis.set_title(title)
+            axis.axis("off")
+        fig.tight_layout()
+        if save_to is not None:
+            Path(save_to).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_to)
+        if show:
+            plt.show()
+        plt.close(fig)
+        return {
+            "labels_before": before,
+            "labels_after": after,
+            "unexpected_labels": unexpected,
+            "labels_preserved": valid,
+            "shape_matches": output.shape[:2] == labels.shape,
+            "image_dtype": str(output.dtype),
+            "mask_dtype": str(labels.dtype),
+            "preview": str(Path(save_to).resolve()) if save_to else None,
+        }
+
     def add(self, augmentation):
         self.augmentations.append(augmentation)
         return self
@@ -181,7 +211,7 @@ def create_albumentations_pipeline(
             transforms.append(A.ElasticTransform(p=probability))
 
     return AlbumentationsTransform(A.Compose(transforms))
-    
+
 
 def _load_file_paths(source, valid_extensions=('.png', '.jpg', '.jpeg', '.bmp')):
     if isinstance(source, list):
@@ -197,78 +227,80 @@ def _load_file_paths(source, valid_extensions=('.png', '.jpg', '.jpeg', '.bmp'))
     else:
         raise ValueError("Must be a directory or a list of file paths.")
 
-# save the augmented image to a folder
+
 def apply_and_save_augmentations(
     images_source,
     masks_source=None,
     output_dir="augmented",
     augmentations=None,
     num_augmented=1,
-    valid_extensions=('.png', '.jpg', '.jpeg', '.bmp'),
-    random_seed=None
-    ):
+    valid_extensions=(".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"),
+    random_seed=None,
+    preview_to=None,
+):
+    """Save augmented copies. RGB arrays and original integer bit depth are preserved."""
+    from ..imageops.preprocess import _match_image_mask_pairs
 
     if random_seed is not None:
         random.seed(random_seed)
         np.random.seed(random_seed)
-    
     if augmentations is None:
-        raise ValueError("At least one augmentation required!")
-    
-    # Load file paths
-    all_images = _load_file_paths(images_source, valid_extensions)
-    all_masks = None
-    
+        raise ValueError("At least one augmentation is required.")
+    if not isinstance(num_augmented, int) or num_augmented < 1:
+        raise ValueError("num_augmented must be a positive integer.")
+    pairs = (
+        _match_image_mask_pairs(images_source, masks_source, valid_extensions)
+        if masks_source is not None
+        else [(p, None) for p in _load_file_paths(images_source, valid_extensions)]
+    )
+    output = Path(output_dir)
+    if any(Path(p).resolve().is_relative_to(output.resolve()) for pair in pairs for p in pair if p):
+        raise ValueError("Augmentation output must not contain source files.")
+    (output / "images").mkdir(parents=True, exist_ok=True)
     if masks_source is not None:
-        all_masks = _load_file_paths(masks_source, valid_extensions)
-        if len(all_images) != len(all_masks):
-            raise ValueError(f"No. Mismatch: {len(all_images)} images vs {len(all_masks)} masks")
-        all_masks.sort()
-    
-    all_images.sort()
-    
-    # make dir
-    img_save_dir = os.path.join(output_dir, 'images')
-    os.makedirs(img_save_dir, exist_ok=True)
-    
-    mask_save_dir = None
-    if all_masks is not None:
-        mask_save_dir = os.path.join(output_dir, 'masks')
-        os.makedirs(mask_save_dir, exist_ok=True)
-    
-    print(f"Processing {len(all_images)} images with {num_augmented} augmented version(s) each...")
-    print(f"Output directory: {os.path.abspath(output_dir)}")
-    
-    # aug pipeline
-    pipeline = AugmentationPipeline(augmentations)
-    
-    # process and save
-    for idx, img_path in enumerate(all_images):
-        base_name = os.path.splitext(os.path.basename(img_path))[0]
-        
-        img = cv2.imread(img_path)
-        if img is None:
-            print(f"Warning: Could not read {img_path}. Skipping.")
-            continue
-        
-        mask = None
-        if all_masks is not None:
-            mask = cv2.imread(all_masks[idx], 0)
-            if mask is None:
-                print(f"Warning: Could not read {all_masks[idx]}. Skipping.")
-                continue
-        
-        for aug_num in range(1, num_augmented + 1):
-            aug_img, aug_mask = pipeline(img.copy(), mask.copy() if mask is not None else None)
-            
-            aug_img_name = f"{base_name}_aug{aug_num}.png"
-            cv2.imwrite(os.path.join(img_save_dir, aug_img_name), aug_img)
-            
-            if aug_mask is not None:
-                cv2.imwrite(os.path.join(mask_save_dir, aug_img_name), aug_mask)
-        
-        if (idx + 1) % 10 == 0:
-            print(f"Processed {idx + 1}/{len(all_images)} images...")
-    
-    print(f"\nAugmented images saved to: {os.path.abspath(output_dir)}")
-    print(f"Generated Total Images: {len(all_images) * num_augmented}")
+        (output / "masks").mkdir(exist_ok=True)
+    pipeline = (
+        augmentations
+        if isinstance(augmentations, AugmentationPipeline)
+        else AugmentationPipeline(augmentations)
+    )
+    saved = []
+    for path, mask_path in pairs:
+        image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise ValueError(f"Could not read image: {path}")
+        if image.ndim == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED) if mask_path else None
+        if mask_path and mask is None:
+            raise ValueError(f"Could not read mask: {mask_path}")
+        AugmentImages._check_type(image, mask)
+        if preview_to and mask is not None and not saved:
+            state, numpy_state = random.getstate(), np.random.get_state()
+            pipeline.preview(image, mask, save_to=preview_to)
+            random.setstate(state)
+            np.random.set_state(numpy_state)
+        for index in range(1, num_augmented + 1):
+            result, labels = pipeline(image.copy(), mask.copy() if mask is not None else None)
+            if result.dtype != image.dtype:
+                raise ValueError("File augmentation must preserve the image dtype.")
+            AugmentImages._check_type(result, labels)
+            if mask is not None and (
+                labels is None or not set(np.unique(labels)).issubset(set(np.unique(mask)) | {0})
+            ):
+                raise ValueError("Augmentation introduced new mask labels or discarded the mask.")
+            suffix = ".tiff" if np.issubdtype(result.dtype, np.floating) else ".png"
+            filename = f"{Path(path).stem}_aug{index}{suffix}"
+            dest = output / "images" / filename
+            bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR) if result.ndim == 3 else result
+            if not cv2.imwrite(
+                str(dest), bgr, [cv2.IMWRITE_TIFF_COMPRESSION, 1] if suffix == ".tiff" else []
+            ):
+                raise OSError(f"Could not save {dest}")
+            if labels is not None:
+                if labels.min() < 0 or labels.max() > 65535:
+                    raise ValueError("PNG mask labels must lie in [0,65535].")
+                labels = labels.astype(np.uint8 if labels.max() <= 255 else np.uint16)
+                cv2.imwrite(str(output / "masks" / filename), labels)
+            saved.append(str(dest.resolve()))
+    return saved

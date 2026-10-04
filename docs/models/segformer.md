@@ -50,7 +50,7 @@ Pass these options through `model_kwargs`. Set `in_channels`, `num_classes`, and
 
 Use dimensions of at least 32 with the default reduction ratios. Custom ratios require sufficiently large feature maps at each stage. Rectangular inputs are supported.
 
-`dims`, `heads`, `ff_expansion`, `reduction_ratio`, and `num_layers` accept a scalar or a tuple of four values. Use tuples for stage-specific settings. Lists are not interpreted as stage tuples.
+`dims`, `heads`, `ff_expansion`, `reduction_ratio`, and `num_layers` accept a scalar or a tuple of four values. Use tuples for stage-specific settings. Lists from JSON are converted to stage tuples automatically.
 
 The direct model returns scores at the first encoder scale, approximately one-quarter resolution. `Segmenter` resizes these scores to the input resolution.
 

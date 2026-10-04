@@ -69,3 +69,37 @@ Provide source images to save visual examples.
 
 `find_best_threshold` is binary-only. Supply `thresholds` to replace its 17 cutoffs from 0.1 to 0.9.
 Pass the selected threshold explicitly to subsequent inference or evaluation calls.
+
+## Empty masks, ignored pixels, and aggregation
+
+Use `empty_policy="exclude"` (default), `"zero"`, or `"one"` for a class absent from both prediction and target.
+False-positive predictions on an empty target receive zero overlap scores. They are not excluded.
+Images containing only ignored labels always receive undefined scores and never contribute to averages.
+Undefined scores appear as `None` in Python, `null` in JSON, and empty cells in CSV.
+
+Use `aggregation="per_image"` to average defined image scores.
+Use `aggregation="dataset"` to pool true positives, false positives, and false negatives before calculating scores.
+The result always includes both `mean` and `dataset`. Its `scores` field contains the selected aggregation.
+
+```python
+from bicbioseg import Segmenter
+
+result = Segmenter.evaluate_predictions(
+    "predictions", "cell_dataset/test/masks",
+    num_classes=3, ignore_index=255, include_background=False,
+    aggregation="dataset", empty_policy="exclude",
+)
+print(result["scores"])
+print(result["class_support"])
+print(result["ignored_only_samples"])
+```
+
+`class_support` contains pixel counts, sample counts, and confusion counts for every class, including background.
+`include_background` controls multiclass score averages. Binary scores describe foreground.
+A class absent from the target but predicted by the model still contributes its false positives.
+Training uses the same rules through `Segmenter(metric_aggregation=..., empty_policy=..., include_background=...)`.
+
+Evaluation through a model saves provenance: checkpoint, epoch, split, threshold, class names, and prediction directory.
+`evaluate` accepts `batch_size` for folder prediction and `split` for the report label.
+`exp.evaluate(checkpoint="best", split="test")` selects a saved checkpoint without replacing the current model.
+Threshold tuning and failure mining exclude undefined scores. If no threshold has a defined score, its selected threshold is `None`.

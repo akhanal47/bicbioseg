@@ -49,6 +49,8 @@ config = TrainingConfig(
 | `aux_loss_weights` | `None` | Weights for auxiliary heads. Use two finite nonnegative values for the supported full models. |
 | `crop_size` | `None` | Optional training crop as `(height, width)`. Must fit each source image. The loader then resizes it to `image_size`. |
 | `foreground_probability` | `0.0` | Probability from 0 to 1 of centering a crop on a foreground pixel. Requires `crop_size` when positive. |
+| `checkpoint_interval` | `None` | Positive epoch interval for atomic `last_model.pt` saves. Requires `experiment_dir`. |
+| `dataset_id` | `None` | Optional explicit dataset identity. Otherwise fingerprint supported file, array, or tensor datasets. |
 
 ## Reduce memory use
 
@@ -98,3 +100,14 @@ A supplied configuration replaces the matching training keywords.
 The four optional path/name fields preserve direct keyword values when their config value is `None`.
 These fields are `save_to`, `experiment_dir`, `run_name`, and `resume_from`.
 Without validation data, the default `val_loss` monitor becomes `train_loss`.
+
+## Checkpoint provenance
+
+Checkpoints store a format version, package versions, completed epoch, dataset identity, and training settings.
+Each write uses a temporary file followed by an atomic replacement. A failed write leaves the previous checkpoint intact.
+`checkpoint_interval=1` saves `last_model.pt` after every completed epoch. Resume starts at the next epoch.
+
+File, array, and TensorDataset inputs receive content fingerprints. Dataset fingerprints include train/validation membership.
+Custom datasets without inspectable sources receive a descriptor marked `content_verified=False`.
+Supply `dataset_id` for an externally managed dataset revision. Keep that ID unchanged when resuming.
+A verified identity mismatch stops resume. Unknown future checkpoint formats produce an explicit error.

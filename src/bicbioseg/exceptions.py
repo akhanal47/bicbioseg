@@ -6,7 +6,7 @@ class DatasetError(BicBioSegError):
     """Raised when dataset inputs or structure are invalid."""
 
 
-class ModelError(BicBioSegError):
+class ModelError(BicBioSegError, ValueError):
     """Raised when model construction or training configuration is invalid."""
 
 
