@@ -17,12 +17,20 @@ from torch.utils.data import DataLoader as TorchDataLoader
 from .config import SegmenterConfig, TrainingConfig, ExperimentRunConfig
 from .exceptions import InferenceError, ModelError
 from .models.registry import MODEL_ALIASES, build_model, model_metadata
+from .models.options import model_options, normalize_model_options
 from .utils.preprocessing import image_tensor, read_rgb, validate_normalization, normalize_image
 from .utils.training import autocast_context, validate_training_options, make_scheduler
 from .utils import losses as loss_module
 from .utils.load_data import DataLoader
-from .utils.metrics import dice_score, jac_score, precision, recall
 from .utils.progress import progress_iter
+from .utils.evaluation import MetricAccumulator, validate_metric_options
+from .utils.checkpoints import (
+    CHECKPOINT_FORMAT_VERSION,
+    atomic_torch_save,
+    read_checkpoint,
+    package_versions,
+    dataset_identity,
+)
 
 
 class Segmenter:
@@ -57,6 +65,10 @@ class Segmenter:
         loss_kwargs: Optional[dict] = None,
         normalization: Optional[dict] = None,
         ignore_index: Optional[int] = None,
+        include_background: bool = False,
+        metric_aggregation: str = "per_image",
+        empty_policy: str = "exclude",
+        class_map: Optional[dict] = None,
     ):
         self.architecture = self.MODEL_ALIASES.get(architecture.lower(), architecture.lower())
         self.loss_name = loss.lower() if isinstance(loss, str) else loss.__class__.__name__
@@ -67,12 +79,34 @@ class Segmenter:
             raise ModelError("num_classes and in_channels must be positive.")
         self.num_classes = num_classes
         self.in_channels = in_channels
-        self.model_kwargs = dict(model_kwargs or {})
+        self.model_kwargs = normalize_model_options(
+            self.architecture,
+            model_kwargs,
+            in_channels=in_channels,
+            num_classes=num_classes,
+            image_size=self.image_size,
+        )
         self.loss_kwargs = dict(loss_kwargs or {})
         self.normalization = validate_normalization(normalization)
         if ignore_index is not None and (isinstance(ignore_index, bool) or not isinstance(ignore_index, int)):
             raise ModelError("ignore_index must be an integer or None.")
         self.ignore_index = ignore_index
+        validate_metric_options(metric_aggregation, empty_policy)
+        self.include_background, self.metric_aggregation, self.empty_policy = (
+            include_background,
+            metric_aggregation,
+            empty_policy,
+        )
+        self.class_map = {int(k): str(v) for k, v in (class_map or {}).items()}
+        if not self.class_map:
+            self.class_map = (
+                {0: "background", 1: "foreground"}
+                if num_classes == 1
+                else {i: f"class_{i}" for i in range(num_classes)}
+            )
+        expected = set(range(2 if num_classes == 1 else num_classes))
+        if set(self.class_map) != expected or len(set(self.class_map.values())) != len(self.class_map):
+            raise ModelError("class_map must supply a unique name for every class ID, including background.")
         self._training_options = {}
         self._scheduler = self._scaler = None
 
@@ -86,11 +120,18 @@ class Segmenter:
         if isinstance(self.loss_fn, torch.nn.Module):
             self.loss_fn.to(self.device)
         self.history: Dict[str, List[float]] = {}
+        self.completed_epoch = 0
+        self.dataset_identity = None
+        self.checkpoint_path = None
 
     @classmethod
     def available_models(cls, detailed=False):
         names = sorted(set(cls.MODEL_ALIASES.values()))
         return {name: model_metadata(name) for name in names} if detailed else names
+
+    @staticmethod
+    def model_options(architecture):
+        return model_options(architecture)
 
     @classmethod
     def available_losses(cls) -> List[str]:
@@ -110,6 +151,10 @@ class Segmenter:
             loss_kwargs=config.loss_kwargs,
             normalization=config.normalization,
             ignore_index=config.ignore_index,
+            include_background=config.include_background,
+            metric_aggregation=config.metric_aggregation,
+            empty_policy=config.empty_policy,
+            class_map=config.class_map,
         )
 
     @staticmethod
@@ -291,6 +336,10 @@ class Segmenter:
             "loss_kwargs": self.loss_kwargs,
             "normalization": self.normalization,
             "ignore_index": self.ignore_index,
+            "include_background": self.include_background,
+            "metric_aggregation": self.metric_aggregation,
+            "empty_policy": self.empty_policy,
+            "class_map": self.class_map,
             "device": str(self.device),
         }
 
@@ -516,23 +565,27 @@ class Segmenter:
             raise ModelError(f"Multiclass targets must have shape NHW and integer IDs in [0, {self.num_classes - 1}].")
         return targets.long()
 
-    def _metric_values(self, outputs: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
-        predictions = (outputs.sigmoid()[:, 0] > 0.5) if self.num_classes == 1 else outputs.argmax(dim=1)
+    def _metric_accumulator(self):
+        return MetricAccumulator(
+            self.num_classes,
+            self.metrics,
+            self.include_background,
+            self.ignore_index,
+            self.empty_policy,
+            aggregation=self.metric_aggregation,
+        )
+
+    def _add_metric_batch(self, accumulator, outputs, targets):
+        predictions = outputs.sigmoid()[:, 0] > 0.5 if self.num_classes == 1 else outputs.argmax(dim=1)
         targets = targets[:, 0] if targets.ndim == 4 else targets
-        values = {name: [] for name in self.metrics}
-        functions = {"dice": dice_score, "iou": jac_score, "precision": precision, "recall": recall}
-        # same image-wise foreground macro averaging used by evaluate_predictions.
-        for prediction, target in zip(predictions, targets):
-            valid = target != self.ignore_index if self.ignore_index is not None else torch.ones_like(target, dtype=torch.bool)
-            classes = [None] if self.num_classes == 1 else range(1, self.num_classes)
-            for name in self.metrics:
-                scores = []
-                for class_id in classes:
-                    pred = prediction if class_id is None else prediction == class_id
-                    truth = target > 0 if class_id is None else target == class_id
-                    scores.append(functions[name](truth[valid].float(), pred[valid].float()))
-                values[name].append(torch.stack(scores).mean())
-        return {name: float(torch.stack(scores).mean().detach().cpu()) for name, scores in values.items()}
+        for prediction, target in zip(predictions.detach().cpu().numpy(), targets.detach().cpu().numpy()):
+            accumulator.add(prediction, target)
+
+    def _metric_values(self, outputs, targets):
+        accumulator = self._metric_accumulator()
+        self._add_metric_batch(accumulator, outputs, targets)
+        scores = accumulator.summary()["scores"]
+        return {name: scores[name if self.num_classes == 1 else f"macro_{name}"] for name in self.metrics}
 
     @staticmethod
     def _tensor_image_to_numpy(image: torch.Tensor) -> np.ndarray:
@@ -629,6 +682,7 @@ class Segmenter:
         self.model.train(is_train)
         totals: Dict[str, float] = {"loss": 0.0}
         samples = pending_batches = pending_samples = 0
+        metric_accumulator = self._metric_accumulator()
         options = self._training_options
         precision = options.get("precision", "fp32")
         accumulation = options.get("accumulation_steps", 1)
@@ -669,10 +723,8 @@ class Segmenter:
                 if pending_batches == accumulation:
                     step(pending_samples)
                     pending_batches = pending_samples = 0
-            metric_values = self._metric_values(outputs.detach().float(), targets.detach())
+            self._add_metric_batch(metric_accumulator, outputs.detach().float(), targets.detach())
             totals["loss"] += float(loss.detach().cpu()) * batch_size
-            for name, value in metric_values.items():
-                totals[name] = totals.get(name, 0.0) + value * batch_size
             samples += batch_size
         if is_train and pending_batches:
             step(pending_samples)
@@ -680,12 +732,19 @@ class Segmenter:
             raise ValueError("Cannot train or validate on an empty loader.")
         if is_train:
             self._last_train_samples = samples
-        return {name: value / samples for name, value in totals.items()}
+        self.last_metric_summary = metric_accumulator.summary()
+        scores = self.last_metric_summary["scores"]
+        return {
+            "loss": totals["loss"] / samples,
+            **{name: scores[name if self.num_classes == 1 else f"macro_{name}"] for name in self.metrics},
+        }
 
     def _load_checkpoint_for_resume(self, path, optimizer=None, checkpoint=None):
-        checkpoint = checkpoint if checkpoint is not None else torch.load(path, map_location="cpu")
+        checkpoint = checkpoint if checkpoint is not None else read_checkpoint(path, map_location="cpu")
         self.model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
         self.history = checkpoint.get("history", self.history)
+        self.completed_epoch = checkpoint.get("completed_epoch", len(self.history.get("train_loss", [])))
+        self.checkpoint_path = str(Path(path).resolve())
         if optimizer is not None and "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         for name, obj in (("scheduler", self._scheduler), ("scaler", self._scaler)):
@@ -736,6 +795,8 @@ class Segmenter:
         aux_loss_weights: Optional[Sequence[float]] = None,
         crop_size=None,
         foreground_probability: Optional[float] = None,
+        checkpoint_interval: Optional[int] = None,
+        dataset_id: Optional[str] = None,
     ) -> Dict[str, List[float]]:
         if config is not None:
             epochs = config.epochs
@@ -760,8 +821,9 @@ class Segmenter:
             scheduler, scheduler_kwargs = config.scheduler, config.scheduler_kwargs
             aux_loss_weights = config.aux_loss_weights
             crop_size, foreground_probability = config.crop_size, config.foreground_probability
+            checkpoint_interval, dataset_id = config.checkpoint_interval, config.dataset_id
 
-        checkpoint = torch.load(resume_from, map_location="cpu") if resume_from is not None else {}
+        checkpoint = read_checkpoint(resume_from, map_location="cpu") if resume_from is not None else {}
         saved_options = checkpoint.get("training_options", {})
         if optimizer is None:
             optimizer = checkpoint.get("optimizer_name", "adam")
@@ -800,6 +862,19 @@ class Segmenter:
             transforms=transforms,
             num_workers=num_workers,
         )
+        if checkpoint_interval is not None and (
+            isinstance(checkpoint_interval, bool)
+            or not isinstance(checkpoint_interval, int)
+            or checkpoint_interval < 1
+        ):
+            raise ValueError("checkpoint_interval must be a positive integer or None.")
+        identity = dataset_identity(train_loader, val_loader, dataset_id)
+        saved_identity = checkpoint.get("dataset_identity")
+        if saved_identity and saved_identity.get("kind") != "descriptor" and saved_identity != identity:
+            raise ValueError(
+                "Resume dataset identity differs from the checkpoint. Use the same data and dataset_id."
+            )
+        self.dataset_identity = identity
         if epochs < 1 or patience < 0 or min_delta < 0:
             raise ValueError("epochs must be positive; patience and min_delta must be nonnegative.")
         if monitor_mode not in {"auto", "min", "max"}:
@@ -816,17 +891,24 @@ class Segmenter:
         if resume_from is not None:
             self._load_checkpoint_for_resume(resume_from, optimizer=optimizer_obj, checkpoint=checkpoint)
 
+        if resume_from is None:
+            self.completed_epoch = 0
+            self.checkpoint_path = None
         if resume_from is None or not self.history:
             self.history = {"train_loss": []}
         else:
             self.history.setdefault("train_loss", [])
         run_dir = self._prepare_run_dir(experiment_dir, run_name, resume_from)
         self.last_run_dir = run_dir
+        if checkpoint_interval is not None and run_dir is None:
+            raise ValueError("checkpoint_interval requires experiment_dir.")
         best_value = None
         stale_epochs = 0
         resolved_monitor_mode = self._monitor_mode(monitor, monitor_mode)
         # reconstruct the best value and patience from completed epochs on resume.
         for value in self.history.get(monitor, []):
+            if value is None:
+                continue
             if self._is_improved(value, best_value, resolved_monitor_mode, min_delta):
                 best_value, stale_epochs = value, 0
             else:
@@ -844,6 +926,8 @@ class Segmenter:
             "patience": patience,
             "min_delta": min_delta,
             "monitor_mode": resolved_monitor_mode,
+            "checkpoint_interval": checkpoint_interval,
+            "dataset_id": dataset_id,
         }
         if run_dir is not None:
             config = self._config()
@@ -861,6 +945,7 @@ class Segmenter:
         for epoch in epoch_iter:
             self.history.setdefault("lr", []).append(optimizer_obj.param_groups[0]["lr"])
             train_stats = self._run_epoch(train_loader, optimizer=optimizer_obj)
+            train_metric_summary = getattr(self, "last_metric_summary", {})
             processed_samples += getattr(self, "_last_train_samples", 0)
             self.history["train_loss"].append(train_stats["loss"])
             for name, value in train_stats.items():
@@ -883,12 +968,25 @@ class Segmenter:
 
             if self._scheduler is not None:
                 if options["scheduler"] == "plateau":
-                    self._scheduler.step(self.history[monitor][-1])
+                    if self.history[monitor][-1] is not None:
+                        self._scheduler.step(self.history[monitor][-1])
                 else:
                     self._scheduler.step()
+            self.completed_epoch += 1
+            self.checkpoint_path = None
+            self.training_metric_summary = {
+                "train": train_metric_summary,
+                "validate": getattr(self, "last_metric_summary", {}) if val_loader is not None else None,
+            }
+            if (
+                run_dir is not None
+                and checkpoint_interval
+                and self.completed_epoch % checkpoint_interval == 0
+            ):
+                self.save(run_dir / "last_model.pt", optimizer=optimizer_obj)
             self._update_run_artifacts(run_dir)
             monitor_values = self.history.get(monitor)
-            if monitor_values:
+            if monitor_values and monitor_values[-1] is not None:
                 current_value = monitor_values[-1]
                 improved = self._is_improved(current_value, best_value, resolved_monitor_mode, min_delta)
                 if improved:
@@ -933,6 +1031,7 @@ class Segmenter:
                     "best_monitor": monitor,
                     "best_value": best_value,
                     "performance": self.performance,
+                    "metric_summary": self.training_metric_summary,
                 },
             )
 
@@ -940,6 +1039,11 @@ class Segmenter:
 
     def save(self, path: Union[str, os.PathLike], optimizer=None) -> str:
         checkpoint = {
+            "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
+            "package_versions": package_versions(),
+            "completed_epoch": self.completed_epoch,
+            "dataset_identity": self.dataset_identity,
+            "training_config": getattr(self, "last_training_config", {}),
             "architecture": self.architecture,
             "loss": self.loss_name,
             "metrics": self.metrics,
@@ -950,6 +1054,10 @@ class Segmenter:
             "loss_kwargs": self.loss_kwargs,
             "normalization": self.normalization,
             "ignore_index": self.ignore_index,
+            "include_background": self.include_background,
+            "metric_aggregation": self.metric_aggregation,
+            "empty_policy": self.empty_policy,
+            "class_map": self.class_map,
             "model_state_dict": self.model.state_dict(),
             "history": self.history,
         }
@@ -970,7 +1078,7 @@ class Segmenter:
                 checkpoint["cuda_rng_state"] = torch.cuda.get_rng_state_all()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(checkpoint, path)
+        atomic_torch_save(checkpoint, path)
         return str(path.resolve())
 
     def summary(self, input_size=None) -> Dict[str, object]:
@@ -1007,46 +1115,96 @@ class Segmenter:
         return info
 
     def load_weights(self, path: Union[str, os.PathLike]):
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = read_checkpoint(path, map_location=self.device)
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         self.model.load_state_dict(state_dict)
         self.history = checkpoint.get("history", self.history)
         return self
 
-    def create_report(
-        self,
-        run_dir: Union[str, os.PathLike],
-        save_to: Optional[Union[str, os.PathLike]] = None,
-    ) -> str:
+    def create_report(self, run_dir, save_to=None, evaluation_dirs=None, prediction_dirs=None):
+        """Write a report using explicit artifact locations and their saved provenance."""
         run_path = Path(run_dir)
         report_path = Path(save_to) if save_to is not None else run_path / "report.md"
         report_path.parent.mkdir(parents=True, exist_ok=True)
-
-        config_path = run_path / "config.json"
-        summary_path = run_path / "summary.json"
         history_plot = run_path / "history.png"
         if self.history and not history_plot.exists():
             self.plot_history(save_to=history_plot, show=False)
+        lines = ["# Segmentation run report", ""]
 
-        lines = ["# Segmentation Run Report", ""]
-        if config_path.exists():
-            lines.extend(["## Config", "", "```json", config_path.read_text().strip(), "```", ""])
-        if summary_path.exists():
-            lines.extend(["## Summary", "", "```json", summary_path.read_text().strip(), "```", ""])
+        def link(path):
+            return Path(os.path.relpath(path, report_path.parent)).as_posix().replace(" ", "%20")
+
+        for title, filename in [
+            ("Model and training settings", "config.json"),
+            ("Training summary", "summary.json"),
+        ]:
+            path = run_path / filename
+            if path.exists():
+                lines.extend([f"## {title}", "", "```json", path.read_text().strip(), "```", ""])
         if history_plot.exists():
-            lines.extend(["## Training Curves", "", f"![Training history]({history_plot.name})", ""])
-
-        prediction_overlays = sorted((run_path / "predictions" / "overlays").glob("*.png"))
-        if prediction_overlays:
-            lines.extend(["## Prediction Overlays", ""])
-            for overlay_path in prediction_overlays[:12]:
-                lines.append(f"![{overlay_path.name}]({overlay_path.relative_to(run_path)})")
-            lines.append("")
-
-        evaluation_summary = run_path / "evaluation" / "evaluation_summary.json"
-        if evaluation_summary.exists():
-            lines.extend(["## Evaluation", "", "```json", evaluation_summary.read_text().strip(), "```", ""])
-
+            lines.extend([f"![Training history]({link(history_plot)})", ""])
+        example_dirs = list(prediction_dirs or [run_path / "predictions"])
+        for directory in evaluation_dirs or [run_path / "evaluation"]:
+            path = Path(directory) / "evaluation_summary.json"
+            if not path.exists():
+                continue
+            result = json.loads(path.read_text())
+            provenance = result.get("provenance", {})
+            lines.extend(
+                [
+                    "## Evaluation",
+                    "",
+                    f"Source: [{path.parent.name}]({link(path)})",
+                    "",
+                    f"Checkpoint: {provenance.get('checkpoint') or 'current in-memory model'}",
+                    f"Completed epoch: {provenance.get('completed_epoch', 'unknown')}",
+                    f"Dataset split: {provenance.get('split') or 'custom'}",
+                    f"Threshold: {provenance.get('threshold')}",
+                    f"Aggregation: {result.get('aggregation', 'per_image')}",
+                    f"Empty policy: {result.get('empty_policy', 'unknown')}",
+                    f"Valid samples: {result.get('num_valid_samples', result.get('num_samples'))}",
+                    f"Ignored-only samples: {result.get('ignored_only_samples', 0)}",
+                    "",
+                    "| Metric | Score |",
+                    "| --- | --- |",
+                ]
+            )
+            for metric, value in result.get("scores", result.get("mean", {})).items():
+                lines.append(f"| {metric} | {value if value is not None else 'undefined (excluded)'} |")
+            lines.extend(
+                [
+                    "",
+                    "Class support:",
+                    "",
+                    "```json",
+                    json.dumps(result.get("class_support", {}), indent=2),
+                    "```",
+                    "",
+                ]
+            )
+            if provenance.get("prediction_dir"):
+                example_dirs.append(provenance["prediction_dir"])
+        for directory in dict.fromkeys(map(str, example_dirs)):
+            root = Path(directory)
+            manifest = root / "predictions.json"
+            if manifest.exists():
+                records = json.loads(manifest.read_text()).get("predictions", [])
+                if records:
+                    lines.extend(
+                        [
+                            "## Prediction provenance",
+                            "",
+                            "```json",
+                            json.dumps(records[0]["metadata"], indent=2),
+                            "```",
+                            "",
+                        ]
+                    )
+            overlays = sorted((root / "overlays").glob("*.png"))[:6]
+            if overlays:
+                lines.extend(["## Example predictions", ""])
+                for overlay in overlays:
+                    lines.extend([f"![{overlay.stem}]({link(overlay)})", ""])
         report_path.write_text("\n".join(lines))
         return str(report_path.resolve())
 
@@ -1058,7 +1216,7 @@ class Segmenter:
         loss: Optional[Union[str, torch.nn.Module, Callable]] = None,
         **overrides,
     ):
-        checkpoint = torch.load(path, map_location=cls.resolve_device(device))
+        checkpoint = read_checkpoint(path, map_location=cls.resolve_device(device))
         saved_image_size = checkpoint.get("image_size", (224, 224))
         if isinstance(saved_image_size, list):
             saved_image_size = tuple(saved_image_size)
@@ -1074,6 +1232,10 @@ class Segmenter:
             "loss_kwargs": checkpoint.get("loss_kwargs", {}),
             "normalization": checkpoint.get("normalization"),
             "ignore_index": checkpoint.get("ignore_index"),
+            "include_background": checkpoint.get("include_background", False),
+            "metric_aggregation": checkpoint.get("metric_aggregation", "per_image"),
+            "empty_policy": checkpoint.get("empty_policy", "exclude"),
+            "class_map": checkpoint.get("class_map"),
             "device": device,
         }
         config.update(overrides)
@@ -1094,6 +1256,11 @@ class Segmenter:
         segmenter.model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
         segmenter.model_kwargs = saved_model_kwargs
         segmenter.history = checkpoint.get("history", {})
+        segmenter.completed_epoch = checkpoint.get(
+            "completed_epoch", len(segmenter.history.get("train_loss", []))
+        )
+        segmenter.dataset_identity = checkpoint.get("dataset_identity")
+        segmenter.checkpoint_path = str(Path(path).resolve())
         segmenter.model.eval()
         return segmenter
 
@@ -1116,22 +1283,9 @@ class Segmenter:
         raise InferenceError(f"Could not find image source: {paths_or_dir}")
 
     def _predict_array(self, rgb: np.ndarray, threshold: float = 0.5, return_raw: bool = False):
-        if not 0 <= threshold <= 1:
-            raise ValueError("threshold must lie in [0, 1].")
-        tensor = image_tensor(rgb, self.image_size, self.in_channels, self.normalization).unsqueeze(0).to(self.device)
-        self.model.eval()
-        with torch.no_grad():
-            output = self._forward_logits(tensor)
-            output = torch.nn.functional.interpolate(output, size=rgb.shape[:2], mode="bilinear", align_corners=False)
-            if self.num_classes == 1:
-                logits = output[0, 0].cpu().numpy()
-                probability = output.sigmoid()[0, 0].cpu().numpy()
-                pred = (probability > threshold).astype(np.uint8) * 255
-            else:
-                logits = output[0].cpu().numpy()
-                probability = output.softmax(dim=1)[0].cpu().numpy()
-                pred = probability.argmax(axis=0).astype(np.uint8 if self.num_classes <= 256 else np.uint16)
-        return (pred, probability, logits) if return_raw else pred
+        self._validate_prediction_request([], 1, threshold)
+        prediction, probability, logits = self._predict_batch([rgb], threshold)[0]
+        return (prediction, probability, logits) if return_raw else prediction
 
     def _predict_single_image(self, image_path: Union[str, os.PathLike], threshold: float = 0.5, return_raw=False):
         rgb = read_rgb(image_path)
@@ -1153,54 +1307,168 @@ class Segmenter:
         cv2.drawContours(canvas, contours, -1, 255, 1)
         cv2.imwrite(str(path), canvas)
 
+    def _prediction_metadata(self, threshold):
+        return {
+            "architecture": self.architecture,
+            "checkpoint": self.checkpoint_path,
+            "completed_epoch": self.completed_epoch,
+            "dataset_identity": self.dataset_identity,
+            "threshold": threshold if self.num_classes == 1 else None,
+            "num_classes": self.num_classes,
+            "class_map": self.class_map,
+            "normalization": self.normalization,
+            "image_size": list(self.image_size),
+        }
+
+    def _prediction_record(
+        self, source, paths, threshold, prediction, probability=None, logits=None, arrays=False
+    ):
+        return {
+            "source": str(Path(source).resolve()),
+            "shape": list(prediction.shape),
+            "paths": paths,
+            "metadata": self._prediction_metadata(threshold),
+            "mask": prediction if arrays else None,
+            "probability": probability if arrays else None,
+            "logits": logits if arrays else None,
+        }
+
+    @staticmethod
+    def _save_prediction_manifest(path, records):
+        Segmenter._write_json(
+            path,
+            {
+                "format_version": 1,
+                "predictions": [
+                    {k: v for k, v in r.items() if k not in ("mask", "probability", "logits")}
+                    for r in records
+                ],
+            },
+        )
+
+    @staticmethod
+    def _validate_prediction_request(paths, batch_size, threshold):
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer.")
+        if not np.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise ValueError("threshold must lie in [0,1].")
+        stems = [Path(path).stem for path in paths]
+        if len(stems) != len(set(stems)):
+            raise InferenceError("Duplicate image stems would overwrite predictions.")
+
+    def _predict_batch(self, images, threshold):
+        tensors = torch.stack(
+            [image_tensor(rgb, self.image_size, self.in_channels, self.normalization) for rgb in images]
+        ).to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            output = self._forward_logits(tensors)
+            results = []
+            for index, rgb in enumerate(images):
+                logits = torch.nn.functional.interpolate(
+                    output[index : index + 1], size=rgb.shape[:2], mode="bilinear", align_corners=False
+                )
+                if self.num_classes == 1:
+                    probability = logits.sigmoid()[0, 0].cpu().numpy()
+                    prediction = (probability > threshold).astype(np.uint8) * 255
+                    scores = logits[0, 0].cpu().numpy()
+                else:
+                    probability = logits.softmax(1)[0].cpu().numpy()
+                    prediction = probability.argmax(0).astype(
+                        np.uint8 if self.num_classes <= 256 else np.uint16
+                    )
+                    scores = logits[0].cpu().numpy()
+                results.append((prediction, probability, scores))
+            return results
+
+    def _save_prediction_files(
+        self,
+        output_dir,
+        source,
+        rgb,
+        prediction,
+        probability=None,
+        logits=None,
+        save_overlay=False,
+        save_probability=False,
+        save_logits=False,
+        save_contours=False,
+    ):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(source).stem
+        mask_path = output_dir / f"{stem}_mask.png"
+        cv2.imwrite(str(mask_path), prediction)
+        paths = {"mask": str(mask_path.resolve())}
+        if save_overlay:
+            directory = output_dir / "overlays"
+            directory.mkdir(exist_ok=True)
+            path = directory / f"{stem}_overlay.png"
+            overlay = self._overlay_mask_on_image(rgb, prediction)
+            cv2.imwrite(str(path), cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+            paths["overlay"] = str(path.resolve())
+        for enabled, kind, array in [
+            (save_probability, "probability", probability),
+            (save_logits, "logits", logits),
+        ]:
+            if enabled:
+                directory = output_dir / ("probabilities" if kind == "probability" else "logits")
+                directory.mkdir(exist_ok=True)
+                path = directory / f"{stem}_{kind}.npy"
+                np.save(path, array)
+                paths[kind] = str(path.resolve())
+        if save_contours:
+            directory = output_dir / "contours"
+            directory.mkdir(exist_ok=True)
+            path = directory / f"{stem}_contours.png"
+            self._save_contours(prediction, path)
+            paths["contours"] = str(path.resolve())
+        return paths
+
     def inference(
         self,
         images,
-        save_to: Union[str, os.PathLike] = "predictions",
-        threshold: float = 0.5,
-        return_arrays: bool = False,
-        save_overlay: bool = False,
-        save_probability: bool = False,
-        save_logits: bool = False,
-        save_contours: bool = False,
+        save_to="predictions",
+        threshold=0.5,
+        return_arrays=False,
+        save_overlay=False,
+        save_probability=False,
+        save_logits=False,
+        save_contours=False,
+        batch_size=1,
+        structured=False,
     ):
-        self.model.eval()
-        output_dir = Path(save_to)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        overlay_dir = output_dir / "overlays"
-        if save_overlay:
-            overlay_dir.mkdir(parents=True, exist_ok=True)
-        if save_probability:
-            (output_dir / "probabilities").mkdir(parents=True, exist_ok=True)
-        if save_logits:
-            (output_dir / "logits").mkdir(parents=True, exist_ok=True)
-        if save_contours:
-            (output_dir / "contours").mkdir(parents=True, exist_ok=True)
         image_paths = self._load_inference_images(images)
-        predictions = []
-
-        with torch.no_grad():
-            for image_path in progress_iter(image_paths, desc="Inference"):
-                rgb, pred, probability, logits = self._predict_single_image(
-                    image_path,
-                    threshold=threshold,
-                    return_raw=True,
+        self._validate_prediction_request(image_paths, batch_size, threshold)
+        records = []
+        for start in progress_iter(range(0, len(image_paths), batch_size), desc="Inference"):
+            sources = image_paths[start : start + batch_size]
+            rgbs = [read_rgb(path) for path in sources]
+            for source, rgb, (prediction, probability, logits) in zip(
+                sources, rgbs, self._predict_batch(rgbs, threshold)
+            ):
+                paths = self._save_prediction_files(
+                    save_to,
+                    source,
+                    rgb,
+                    prediction,
+                    probability,
+                    logits,
+                    save_overlay,
+                    save_probability,
+                    save_logits,
+                    save_contours,
                 )
-                out_path = output_dir / f"{Path(image_path).stem}_mask.png"
-                cv2.imwrite(str(out_path), pred)
-                if save_overlay:
-                    overlay = self._overlay_mask_on_image(rgb, pred)
-                    overlay_bgr = cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(str(overlay_dir / f"{Path(image_path).stem}_overlay.png"), overlay_bgr)
-                if save_probability:
-                    np.save(output_dir / "probabilities" / f"{Path(image_path).stem}_probability.npy", probability)
-                if save_logits:
-                    np.save(output_dir / "logits" / f"{Path(image_path).stem}_logits.npy", logits)
-                if save_contours:
-                    self._save_contours(pred, output_dir / "contours" / f"{Path(image_path).stem}_contours.png")
-                predictions.append(pred if return_arrays else str(out_path.resolve()))
-
-        return predictions
+                records.append(
+                    self._prediction_record(
+                        source, paths, threshold, prediction, probability, logits, return_arrays
+                    )
+                )
+        self._save_prediction_manifest(Path(save_to) / "predictions.json", records)
+        self.last_predictions = records
+        return (
+            records if structured else [r["mask"] if return_arrays else r["paths"]["mask"] for r in records]
+        )
 
     def predict_one(
         self,
@@ -1209,11 +1477,15 @@ class Segmenter:
         save_to: Optional[Union[str, os.PathLike]] = None,
         return_overlay: bool = False,
         show: bool = False,
+        structured: bool = False,
     ):
         self.model.eval()
         with torch.no_grad():
-            rgb, pred = self._predict_single_image(image, threshold=threshold)
+            rgb, pred, probability, logits = self._predict_single_image(
+                image, threshold=threshold, return_raw=True
+            )
 
+        paths = {}
         overlay = self._overlay_mask_on_image(rgb, pred)
         if save_to is not None:
             save_path = Path(save_to)
@@ -1221,6 +1493,12 @@ class Segmenter:
             cv2.imwrite(str(save_path), pred)
             overlay_path = save_path.with_name(f"{save_path.stem}_overlay.png")
             cv2.imwrite(str(overlay_path), cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+
+            paths = {"mask": str(save_path.resolve()), "overlay": str(overlay_path.resolve())}
+        record = self._prediction_record(image, paths, threshold, pred, probability, logits, True)
+        if save_to is not None:
+            self._save_prediction_manifest(save_path.with_suffix(".json"), [record])
+        self.last_predictions = [record]
 
         if show:
             import matplotlib.pyplot as plt
@@ -1237,60 +1515,66 @@ class Segmenter:
             fig.tight_layout()
             plt.show()
 
+        if structured:
+            return record
         if return_overlay:
             return pred, overlay
         return pred
 
     @staticmethod
     def ensemble_predict(
-        checkpoints: Sequence[Union[str, os.PathLike]],
+        checkpoints,
         images,
-        save_to: Union[str, os.PathLike] = "ensemble_predictions",
-        threshold: float = 0.5,
-        device: Optional[str] = None,
-        save_overlay: bool = True,
-    ) -> List[str]:
+        save_to="ensemble_predictions",
+        threshold=0.5,
+        device=None,
+        save_overlay=True,
+        batch_size=1,
+        structured=False,
+        return_arrays=False,
+        save_probability=False,
+    ):
         if not checkpoints:
             raise InferenceError("At least one checkpoint is required for ensemble prediction.")
-
-        models = [Segmenter.load(checkpoint, device=device) for checkpoint in checkpoints]
+        models = [Segmenter.load(path, device=device) for path in checkpoints]
         reference = models[0]
-        if any(model.num_classes != reference.num_classes for model in models):
-            raise InferenceError("Ensemble checkpoints must have the same number and ordering of classes.")
+        if any(m.num_classes != reference.num_classes or m.class_map != reference.class_map for m in models):
+            raise InferenceError("Ensemble checkpoints must have the same class count and class map.")
         image_paths = reference._load_inference_images(images)
-        output_dir = Path(save_to)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        overlay_dir = output_dir / "overlays"
-        if save_overlay:
-            overlay_dir.mkdir(parents=True, exist_ok=True)
-
-        saved_paths = []
-        with torch.no_grad():
-            for image_path in progress_iter(image_paths, desc="Ensemble inference"):
-                rgb = read_rgb(image_path)
-
-                probabilities = []
-                for model in models:
-                    _, probability, _ = model._predict_array(rgb, threshold=threshold, return_raw=True)
-                    probabilities.append(probability)
-                mean_probability = np.mean(probabilities, axis=0)
-
-                if reference.num_classes == 1:
-                    prediction = (mean_probability > threshold).astype(np.uint8) * 255
-                else:
-                    prediction = np.argmax(mean_probability, axis=0).astype(np.uint8 if reference.num_classes <= 256 else np.uint16)
-
-                out_path = output_dir / f"{Path(image_path).stem}_mask.png"
-                cv2.imwrite(str(out_path), prediction)
-                if save_overlay:
-                    overlay = reference._overlay_mask_on_image(rgb, prediction)
-                    cv2.imwrite(
-                        str(overlay_dir / f"{Path(image_path).stem}_overlay.png"),
-                        cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR),
-                    )
-                saved_paths.append(str(out_path.resolve()))
-
-        return saved_paths
+        reference._validate_prediction_request(image_paths, batch_size, threshold)
+        records = []
+        for start in progress_iter(range(0, len(image_paths), batch_size), desc="Ensemble inference"):
+            sources = image_paths[start : start + batch_size]
+            rgbs = [read_rgb(path) for path in sources]
+            batches = [model._predict_batch(rgbs, threshold) for model in models]
+            for index, (source, rgb) in enumerate(zip(sources, rgbs)):
+                probability = np.mean([batch[index][1] for batch in batches], axis=0)
+                prediction = (
+                    (probability > threshold).astype(np.uint8) * 255
+                    if reference.num_classes == 1
+                    else probability.argmax(0).astype(np.uint8 if reference.num_classes <= 256 else np.uint16)
+                )
+                paths = reference._save_prediction_files(
+                    save_to,
+                    source,
+                    rgb,
+                    prediction,
+                    probability,
+                    save_overlay=save_overlay,
+                    save_probability=save_probability,
+                )
+                record = reference._prediction_record(
+                    source, paths, threshold, prediction, probability, arrays=return_arrays
+                )
+                record["metadata"]["checkpoint"] = None
+                record["metadata"]["architecture"] = "ensemble"
+                record["metadata"]["members"] = [model._prediction_metadata(threshold) for model in models]
+                record["metadata"]["checkpoints"] = [str(Path(p).resolve()) for p in checkpoints]
+                records.append(record)
+        reference._save_prediction_manifest(Path(save_to) / "predictions.json", records)
+        return (
+            records if structured else [r["mask"] if return_arrays else r["paths"]["mask"] for r in records]
+        )
 
     def inference_large_image(
         self,
@@ -1304,6 +1588,8 @@ class Segmenter:
         tile_batch_size: int = 1,
         weighting: str = "uniform",
         gaussian_sigma: float = 0.125,
+        structured: bool = False,
+        return_arrays: bool = False,
     ) -> Dict[str, str]:
         if isinstance(tile_batch_size, bool) or not isinstance(tile_batch_size, int) or tile_batch_size < 1:
             raise ValueError("tile_batch_size must be a positive integer.")
@@ -1389,7 +1675,19 @@ class Segmenter:
             cv2.imwrite(str(overlay_path), cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
             outputs["overlay"] = str(overlay_path.resolve())
 
-        return outputs
+        record = self._prediction_record(
+            image, outputs, threshold, prediction, probability, arrays=return_arrays
+        )
+        record["metadata"]["tiling"] = {
+            "patch_size": list(patch_size),
+            "overlap": overlap,
+            "weighting": weighting,
+            "gaussian_sigma": gaussian_sigma,
+            "tile_batch_size": tile_batch_size,
+        }
+        self._save_prediction_manifest(output_dir / f"{image_path.stem}_prediction.json", [record])
+        self.last_predictions = [record]
+        return record if structured else outputs
 
     @staticmethod
     def _match_prediction_mask_pairs(predictions, masks):
@@ -1413,124 +1711,95 @@ class Segmenter:
         return pairs
 
     @staticmethod
-    def _binary_metric_value(pred_binary: np.ndarray, mask_binary: np.ndarray, metric: str) -> float:
-        pred_tensor = torch.from_numpy(pred_binary.astype(np.float32))
-        mask_tensor = torch.from_numpy(mask_binary.astype(np.float32))
-        if metric == "dice":
-            return float(dice_score(mask_tensor, pred_tensor))
-        if metric in {"iou", "jaccard"}:
-            return float(jac_score(mask_tensor, pred_tensor))
-        if metric == "precision":
-            return float(precision(mask_tensor, pred_tensor))
-        if metric == "recall":
-            return float(recall(mask_tensor, pred_tensor))
-        raise ValueError(f"Unsupported metric: {metric}")
-
-    @staticmethod
     def _score_prediction_arrays(
-        pred_np: np.ndarray,
-        mask_np: np.ndarray,
-        metrics: Sequence[str],
-        num_classes: Optional[int] = None,
-        class_names: Optional[Sequence[str]] = None,
-        include_background: bool = False,
-        ignore_index: Optional[int] = None,
-    ) -> Dict[str, float]:
-        pred_np = pred_np.squeeze()
-        mask_np = mask_np.squeeze()
+        pred_np,
+        mask_np,
+        metrics,
+        num_classes=None,
+        class_names=None,
+        include_background=False,
+        ignore_index=None,
+        empty_policy="exclude",
+    ):
         if pred_np.shape != mask_np.shape:
-            pred_np = cv2.resize(pred_np, (mask_np.shape[1], mask_np.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-        valid = mask_np != ignore_index if ignore_index is not None else np.ones(mask_np.shape, dtype=bool)
-        pred_np, mask_np = pred_np[valid], mask_np[valid]
-        unique_values = set(np.unique(pred_np).tolist()) | set(np.unique(mask_np).tolist())
-        is_binary = unique_values.issubset({0, 1, 255})
-        metric_keys = [metric.lower() for metric in metrics]
-        scores: Dict[str, float] = {}
-
-        if num_classes == 1 or (is_binary and num_classes is None):
-            pred_binary = pred_np > 0
-            mask_binary = mask_np > 0
-            for metric in metric_keys:
-                scores[metric] = Segmenter._binary_metric_value(pred_binary, mask_binary, metric)
-            return scores
-
+            pred_np = cv2.resize(
+                pred_np, (mask_np.shape[1], mask_np.shape[0]), interpolation=cv2.INTER_NEAREST
+            )
         if num_classes is None:
-            num_classes = int(max(np.max(pred_np, initial=0), np.max(mask_np, initial=0))) + 1
-
-        class_ids = list(range(num_classes))
-        if not include_background and 0 in class_ids:
-            class_ids.remove(0)
-
-        for class_id in class_ids:
-            class_label = class_names[class_id] if class_names and class_id < len(class_names) else f"class_{class_id}"
-            pred_binary = pred_np == class_id
-            mask_binary = mask_np == class_id
-            for metric in metric_keys:
-                key = f"{metric}_{class_label}"
-                scores[key] = Segmenter._binary_metric_value(pred_binary, mask_binary, metric)
-
-        for metric in metric_keys:
-            values = [value for key, value in scores.items() if key.startswith(f"{metric}_")]
-            if values:
-                scores[f"macro_{metric}"] = float(np.mean(values))
-
-        return scores
+            values = set(np.unique(pred_np)) | set(np.unique(mask_np))
+            values.discard(ignore_index)
+            num_classes = 1 if values.issubset({0, 1, 255}) else int(max(values, default=0)) + 1
+        accumulator = MetricAccumulator(
+            num_classes, metrics, include_background, ignore_index, empty_policy, class_names
+        )
+        return accumulator.add(pred_np, mask_np)
 
     @staticmethod
     def evaluate_predictions(
         predictions,
         masks,
-        metrics: Sequence[str] = ("dice", "iou", "precision", "recall"),
-        save_to: Optional[Union[str, os.PathLike]] = None,
-        num_classes: Optional[int] = None,
-        class_names: Optional[Sequence[str]] = None,
-        include_background: bool = False,
-        ignore_index: Optional[int] = None,
-    ) -> Dict[str, object]:
+        metrics=("dice", "iou", "precision", "recall"),
+        save_to=None,
+        num_classes=None,
+        class_names=None,
+        include_background=False,
+        ignore_index=None,
+        empty_policy="exclude",
+        aggregation="per_image",
+    ):
         pairs = Segmenter._match_prediction_mask_pairs(predictions, masks)
+        # Infer once for the complete dataset, so class absence cannot change task type per image.
+        if num_classes is None:
+            values = set()
+            for pair in pairs:
+                for path in pair:
+                    array = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                    if array is None:
+                        raise InferenceError(f"Could not read {path}")
+                    values.update(np.unique(array).tolist())
+            values.discard(ignore_index)
+            num_classes = 1 if values.issubset({0, 1, 255}) else int(max(values, default=0)) + 1
+        accumulator = MetricAccumulator(
+            num_classes, metrics, include_background, ignore_index, empty_policy, class_names, aggregation
+        )
         rows = []
-        totals: Dict[str, List[float]] = {}
-
         for prediction_path, mask_path in pairs:
-            pred_np = cv2.imread(str(prediction_path), cv2.IMREAD_UNCHANGED)
-            mask_np = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
-            if pred_np is None or mask_np is None:
-                raise InferenceError(f"Could not read prediction/mask pair: {prediction_path}, {mask_path}")
-
-            row = {"prediction": Path(prediction_path).name, "mask": Path(mask_path).name}
-            scores = Segmenter._score_prediction_arrays(
-                pred_np=pred_np,
-                mask_np=mask_np,
-                metrics=metrics,
-                num_classes=num_classes,
-                class_names=class_names,
-                include_background=include_background,
-                ignore_index=ignore_index,
+            prediction = cv2.imread(str(prediction_path), cv2.IMREAD_UNCHANGED)
+            target = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+            if prediction is None or target is None:
+                raise InferenceError(f"Could not read {prediction_path} or {mask_path}")
+            if prediction.shape != target.shape:
+                prediction = cv2.resize(
+                    prediction, (target.shape[1], target.shape[0]), interpolation=cv2.INTER_NEAREST
+                )
+            scores = accumulator.add(prediction, target)
+            valid = target != ignore_index if ignore_index is not None else np.ones(target.shape, dtype=bool)
+            rows.append(
+                {
+                    "prediction": Path(prediction_path).name,
+                    "mask": Path(mask_path).name,
+                    "valid_pixels": int(valid.sum()),
+                    "ignored_only": not bool(valid.any()),
+                    **scores,
+                }
             )
-            row.update(scores)
-            for key, value in scores.items():
-                totals.setdefault(key, []).append(value)
-
-            rows.append(row)
-
         summary = {
-            "num_samples": len(rows),
-            "mean": {metric: float(np.mean(values)) for metric, values in totals.items() if values},
+            **accumulator.summary(),
             "rows": rows,
+            "num_classes": num_classes,
+            "include_background": include_background,
+            "ignore_index": ignore_index,
+            "class_names": class_names,
         }
-
         if save_to is not None:
             output_dir = Path(save_to)
             output_dir.mkdir(parents=True, exist_ok=True)
             if rows:
-                fields = sorted({key for row in rows for key in row})
                 with (output_dir / "evaluation.csv").open("w", newline="") as handle:
-                    writer = csv.DictWriter(handle, fieldnames=fields)
+                    writer = csv.DictWriter(handle, fieldnames=sorted({k for r in rows for k in r}))
                     writer.writeheader()
                     writer.writerows(rows)
             Segmenter._write_json(output_dir / "evaluation_summary.json", summary)
-
         return summary
 
     def find_best_threshold(
@@ -1544,7 +1813,9 @@ class Segmenter:
         if self.num_classes != 1:
             raise ValueError("Threshold tuning is only supported for binary segmentation.")
 
-        thresholds = list(thresholds or np.linspace(0.1, 0.9, 17))
+        thresholds = list(np.linspace(0.1, 0.9, 17) if thresholds is None else thresholds)
+        if not thresholds:
+            raise ValueError("Provide at least one threshold.")
         image_paths = self._load_inference_images(images)
         mask_pairs = self._match_prediction_mask_pairs(image_paths, masks)
         mask_by_stem = {Path(mask).stem.replace("_mask", ""): mask for _, mask in mask_pairs}
@@ -1573,23 +1844,23 @@ class Segmenter:
         best_threshold = None
         best_score = None
         metric_key = metric.lower()
+        if metric_key not in {"dice", "iou", "jaccard"}:
+            raise ValueError("metric must be dice, iou, or jaccard.")
         for threshold in thresholds:
-            scores = []
+            if not np.isfinite(threshold) or not 0 <= threshold <= 1:
+                raise ValueError("thresholds must lie in [0, 1].")
+            accumulator = MetricAccumulator(
+                1,
+                (metric_key,),
+                ignore_index=self.ignore_index,
+                empty_policy=self.empty_policy,
+                aggregation=self.metric_aggregation,
+            )
             for probability, target in zip(probabilities, ground_truths):
-                pred = (probability > threshold).astype(np.float32)
-                valid = target != self.ignore_index if self.ignore_index is not None else np.ones(target.shape, dtype=bool)
-                pred_tensor = torch.from_numpy(pred[valid])
-                target_tensor = torch.from_numpy((target[valid] > 0).astype(np.float32))
-                if metric_key == "dice":
-                    score = float(dice_score(target_tensor, pred_tensor))
-                elif metric_key in {"iou", "jaccard"}:
-                    score = float(jac_score(target_tensor, pred_tensor))
-                else:
-                    raise ValueError("metric must be 'dice', 'iou', or 'jaccard'.")
-                scores.append(score)
-            mean_score = float(np.mean(scores))
+                accumulator.add((probability > threshold).astype(np.uint8), target)
+            mean_score = accumulator.summary()["scores"][metric_key]
             rows.append({"threshold": float(threshold), metric_key: mean_score})
-            if best_score is None or mean_score > best_score:
+            if mean_score is not None and (best_score is None or mean_score > best_score):
                 best_score = mean_score
                 best_threshold = float(threshold)
 
@@ -1621,20 +1892,42 @@ class Segmenter:
         threshold: float = 0.5,
         num_classes: Optional[int] = None,
         class_names: Optional[Sequence[str]] = None,
-        include_background: bool = False,
+        include_background: Optional[bool] = None,
+        empty_policy: Optional[str] = None,
+        aggregation: Optional[str] = None,
+        split: Optional[str] = None,
+        batch_size: int = 1,
     ) -> Dict[str, object]:
         prediction_dir = prediction_dir or Path(save_to) / "predictions"
-        predictions = self.inference(images=images, save_to=prediction_dir, threshold=threshold)
-        return self.evaluate_predictions(
+        predictions = self.inference(
+            images=images,
+            save_to=prediction_dir,
+            threshold=threshold,
+            batch_size=batch_size,
+            save_overlay=True,
+        )
+        result = self.evaluate_predictions(
             predictions,
             masks,
             metrics=metrics,
             save_to=save_to,
             num_classes=self.num_classes if num_classes is None else num_classes,
-            class_names=class_names,
-            include_background=include_background,
+            class_names=class_names or [self.class_map[i] for i in sorted(self.class_map)],
+            include_background=self.include_background if include_background is None else include_background,
+            empty_policy=empty_policy or self.empty_policy,
+            aggregation=aggregation or self.metric_aggregation,
             ignore_index=self.ignore_index,
         )
+
+        result["provenance"] = {
+            **self._prediction_metadata(threshold),
+            "split": split,
+            "images": str(images),
+            "masks": str(masks),
+            "prediction_dir": str(Path(prediction_dir).resolve()),
+        }
+        self._write_json(Path(save_to) / "evaluation_summary.json", result)
+        return result
 
     @staticmethod
     def find_worst_predictions(
@@ -1664,7 +1957,9 @@ class Segmenter:
             metric_candidates = [key for key in rows[0] if key == f"macro_{metric_key}" or key.startswith(f"{metric_key}_")]
             metric_key = f"macro_{metric_key}" if f"macro_{metric_key}" in metric_candidates else metric_candidates[0]
 
-        worst = sorted(rows, key=lambda row: row.get(metric_key, float("inf")))[:top_k]
+        worst = sorted(
+            (row for row in rows if row.get(metric_key) is not None), key=lambda row: row[metric_key]
+        )[:top_k]
 
         if save_to is not None:
             output_dir = Path(save_to)
