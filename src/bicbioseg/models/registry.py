@@ -30,6 +30,9 @@ MODEL_SPECS = {
     "resunetplusplus_full": ModelSpec("resunetplusplus_full", "ResUNetPlusPlusFull", "in_channels", "n_classes", aliases=("resunetplusplus", "resunet++")),
     "unext_full": ModelSpec("unext_full", "UNeXtFull", "in_channels", "n_classes", aliases=("unext",)),
     "swin_unet_full": ModelSpec("swin_unet_full", "SwinUNetFull", "in_channels", "n_classes"),
+    "dinov3_seg": ModelSpec("dinov3_seg", "DINOv3Segmenter", "in_channels", "n_classes"),
+    "mednext_2d": ModelSpec("mednext_2d", "MedNeXt2D", "in_channels", "n_classes"),
+    "efficientvit_seg": ModelSpec("efficientvit_seg", "EfficientViTSegmenter", "in_channels", "n_classes"),
 }
 MODEL_ALIASES = {alias: name for name, spec in MODEL_SPECS.items() for alias in (name, *spec.aliases)}
 
@@ -50,8 +53,11 @@ def model_metadata(name):
         "resunetplusplus_full": "SE residual U-Net with decoder attention and bridge/output ASPP.",
         "unext_full": "Convolutional U-Net with shifted token MLP encoder and decoder stages.",
         "swin_unet_full": "Swin encoder and Swin decoder with patch expansion and skip fusion.",
+        "dinov3_seg": "DINOv3 encoder with four-depth feature fusion and a trainable convolutional decoder.",
+        "mednext_2d": "2D MedNeXt with depthwise residual blocks, learned resampling, and additive skips.",
+        "efficientvit_seg": "MIT EfficientViT encoder with additive multiscale fusion and a lightweight MBConv segmentation head.",
     }
-    transformer = name in {"deit", "swin_unet", "pvt_unet", "swin_unet_full", "pvtformer_full"}
+    transformer = name in {"deit", "swin_unet", "pvt_unet", "swin_unet_full", "pvtformer_full", "dinov3_seg", "efficientvit_seg"}
     presets = {
         "deit": ("tiny", "small", "base"), "swin_unet": ("tiny", "small", "base"),
         "swin_unet_full": ("tiny", "small", "base"),
@@ -59,6 +65,9 @@ def model_metadata(name):
         "transunet": ("custom", "resnet50"),
         "pvtformer_full": ("b0", "b1", "b2", "b3", "b4", "b5"),
         "unext_full": ("base", "small"),
+        "dinov3_seg": ("small", "base"),
+        "mednext_2d": ("small", "base"),
+        "efficientvit_seg": ("b0", "b1", "b2", "b3"),
     }
     constraints = {
         "unet": "Spatial dimensions must accommodate 2**num_decoder_blocks downsampling.",
@@ -68,6 +77,7 @@ def model_metadata(name):
         "segformer": "Dimensions >=32 recommended for spatial-reduction attention.",
         "resunetplusplus_full": "Positive spatial dimensions padded to multiples of 8, minimum 16.",
         "unext_full": "Padded to multiples of 32; training requires batch * ceil(H/32) * ceil(W/32) > 1 for BatchNorm.",
+        "mednext_2d": "Positive channel count and spatial dimensions; padded to multiples of 16, minimum 32.",
     }
     return {
         "name": name,
@@ -79,20 +89,24 @@ def model_metadata(name):
         "preset_argument": (
             "encoder_name"
             if name == "transunet"
-            else ("variant" if transformer or name == "unext_full" else None)
+            else ("variant" if transformer or name in {"unext_full", "mednext_2d"} else None)
         ),
-        "dependencies": ["torch", "timm>=1.0.25,<2"] if transformer else ["torch", "torchvision", "einops"],
+        "dependencies": ["torch", "timm>=1.0.25,<2"] if transformer else (["torch"] if name == "mednext_2d" else ["torch", "torchvision", "einops"]),
         "install_extra": "bicbioseg[transformers]" if transformer else None,
         "supported_devices": ["cpu", "cuda", "mps"],
         "device_notes": "Requires an available PyTorch backend; run validate_setup on the target device.",
         "input_constraints": (
+            "1 or 3 channels; padded to multiples of 32; training requires batch * ceil(H/32) * ceil(W/32) > 1 for BatchNorm."
+            if name == "efficientvit_seg" else
             "1 or 3 channels; positive spatial dimensions are padded internally."
             if transformer
             else constraints[name]
         ),
         "deep_supervision": name
-        in {"swin_unet_full", "pvtformer_full", "resunetplusplus_full", "unext_full"},
+        in {"swin_unet_full", "pvtformer_full", "resunetplusplus_full", "unext_full", "mednext_2d"},
         "pretrained": (
+            "DINOv3 LVD-1689M encoder via pretrained=True; decoder starts from scratch. Weights retain the DINOv3 license."
+            if name == "dinov3_seg" else
             "ImageNet encoder only via pretrained=True; decoder starts from scratch."
             if transformer
             else (

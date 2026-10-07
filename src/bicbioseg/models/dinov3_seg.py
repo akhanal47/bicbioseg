@@ -1,8 +1,8 @@
-"""DINOv3 features with a bicbioseg convolutional segmentation decoder.
-
+'''
+DINOv3 features with a bicbioseg convolutional segmentation decoder.
 Encoder and weight reference: https://github.com/facebookresearch/dinov3
 Pretrained weights retain the DINOv3 license; the decoder is trained from scratch.
-"""
+'''
 
 import torch
 from torch import nn
@@ -32,7 +32,7 @@ class _DINOv3Decoder(nn.Module):
 
 
 class DINOv3Segmenter(_EncoderSegmentation):
-    """Small/base DINOv3 encoder with four-depth fusion and trainable upsampling."""
+    '''Small/base DINOv3 encoder with four-depth fusion and trainable upsampling.'''
 
     def __init__(self, in_channels=3, n_classes=1, variant="small", pretrained=False,
                  decoder_channels=(128, 64, 32, 16), dropout=0.1,

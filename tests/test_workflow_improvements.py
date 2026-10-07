@@ -79,6 +79,9 @@ SMALL = {
     "pvtformer_full": {"variant": "b0", "decoder_channels": 8},
     "resunetplusplus_full": {"base_channels": 2, "aspp_rates": [1, 2]},
     "unext_full": {"widths": [4, 8, 8, 16, 16]},
+    "dinov3_seg": {"decoder_channels": [16, 8, 4, 2]},
+    "mednext_2d": {"base_channels": 2, "block_counts": [1] * 9},
+    "efficientvit_seg": {"decoder_channels": 8, "decoder_depth": 1},
 }
 
 

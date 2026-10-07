@@ -1249,7 +1249,7 @@ class Segmenter:
         architecture = cls.MODEL_ALIASES.get(architecture, architecture)
         if architecture == "transunet":
             restore_kwargs["encoder_weights"] = None
-        elif architecture in {"deit", "swin_unet", "swin_unet_full", "pvt_unet", "pvtformer_full", "double_unet"}:
+        elif architecture in {"deit", "swin_unet", "swin_unet_full", "pvt_unet", "pvtformer_full", "double_unet", "dinov3_seg", "efficientvit_seg"}:
             restore_kwargs["pretrained"] = False
         config["model_kwargs"] = restore_kwargs
         segmenter = cls(**config)

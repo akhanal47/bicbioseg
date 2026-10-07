@@ -1,5 +1,5 @@
 '''
-Adapted from MIT Han Lab EfficientViT
+Adapted from MIT Han Lab EfficientViT:
 https://github.com/mit-han-lab/efficientvit
 Notice and Licenses: licenses/NOTICE.txt and licenses/Apache-2.0.txt.
 '''
@@ -45,7 +45,8 @@ class _EfficientViTHead(nn.Module):
 
 
 class EfficientViTSegmenter(_EncoderSegmentation):
-    '''MIT EfficientViT B0–B3 with the B-series Cityscapes-style segmentation head.'''
+    
+    # MIT EfficientViT B0–B3 with the B-series Cityscapes-style segmentation head.
 
     def __init__(self, in_channels=3, n_classes=1, variant="b0", pretrained=False,
                  decoder_channels=None, decoder_depth=None, dropout=0.0,
