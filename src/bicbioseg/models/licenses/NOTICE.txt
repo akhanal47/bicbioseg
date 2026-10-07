@@ -1,0 +1,16 @@
+The following model implementations include adaptations of Apache-2.0 source.
+The license is included in Apache-2.0.txt in this directory.
+
+MedNeXt (mednext_2d.py)
+https://github.com/MIC-DKFZ/MedNeXt
+Copyright 2019 Division of Medical Image Computing, German Cancer Research
+Center (DKFZ), Heidelberg, Germany.
+
+EfficientViT segmentation head (efficientvit_seg.py)
+https://github.com/mit-han-lab/efficientvit
+Copyright 2023 Han Cai.
+
+DINOv3 and EfficientViT encoders are loaded through the optional timm dependency.
+Pretrained encoder checkpoints are not distributed with bicbioseg. DINOv3
+checkpoints retain the DINOv3 license:
+https://github.com/facebookresearch/dinov3/blob/main/LICENSE.md

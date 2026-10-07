@@ -8,7 +8,7 @@ Follow the workflow or open the reference for the setting you need.
 | --- | --- |
 | Prepare pairs, splits, groups, and patches | [Dataset preparation](data.md) |
 | Inspect data, convert formats, and measure objects | [Image operations](image-operations.md) |
-| Choose an architecture and variant | [All 12 models](models/README.md) |
+| Choose an architecture and variant | [All 15 models](models/README.md) |
 | Train, save, and resume | [Training](training.md) |
 | Apply paired transforms | [Augmentation](augmentation.md) |
 | Predict one image, a folder, or a large image | [Inference](inference.md) |

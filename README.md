@@ -17,7 +17,7 @@ Install optional features when you need them:
 
 | Feature | Command |
 | --- | --- |
-| DeiT, Swin, and PVTv2 models | `pip install 'bicbioseg[transformers]'` |
+| DeiT, Swin, PVTv2, DINOv3, and EfficientViT models | `pip install 'bicbioseg[transformers]'` |
 | DICOM conversion | `pip install 'bicbioseg[dicom]'` |
 | Albumentations transforms | `pip install 'bicbioseg[albumentations]'` |
 
@@ -102,7 +102,7 @@ See the [component diagram and user guide](docs/README.md).
 
 ## Choose a model
 
-The library provides 12 architectures. Each link lists its variants, defaults, input requirements, and configuration example.
+The library provides 15 architectures. Each link lists its variants, defaults, input requirements, and configuration example.
 
 | Model | Main choices |
 | --- | --- |
@@ -118,6 +118,9 @@ The library provides 12 architectures. Each link lists its variants, defaults, i
 | [PVTFormer](docs/models/pvtformer_full.md) | b0 through b5, with residual decoding and multiscale fusion |
 | [ResUNet++](docs/models/resunetplusplus_full.md) | Residual blocks, attention, and configurable ASPP |
 | [UNeXt](docs/models/unext_full.md) | base, small, or custom stage widths |
+| [DINOv3 with trainable decoder](docs/models/dinov3_seg.md) | small or base, optional pretrained/frozen encoder, configurable decoder widths |
+| [MedNeXt in 2D](docs/models/mednext_2d.md) | small or base, configurable widths, kernels, depth, and deep supervision |
+| [EfficientViT segmentation](docs/models/efficientvit_seg.md) | b0 through b3, with a lightweight multiscale MBConv head |
 
 DeiT, Swin, and PVTv2 are separate architecture choices. Select them through `model` or `architecture`.
 See [model selection](docs/models/README.md) for shared behavior and setup checks.
