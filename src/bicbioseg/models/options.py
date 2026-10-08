@@ -81,6 +81,26 @@ MODEL_OPTIONS = {
         dropout={**DROP, "default": 0.0},
         deep_supervision=DEEP,
     ),
+    "dinov3_seg": dict(
+        **{**PRETRAINED, "pretrained": BOOL(False, "Initialize encoder with DINOv3 LVD-1689M weights under the DINOv3 license.")},
+        variant=CHOICE("small", ("small", "base"), "DINOv3 ViT size."),
+        decoder_channels=SEQ((128, 64, 32, 16), 4, "Convolutional upsampling widths, coarse to fine."),
+        dropout=DROP,
+    ),
+    "mednext_2d": dict(
+        variant=CHOICE("small", ("small", "base"), "MedNeXt expansion-ratio preset."),
+        base_channels=POS(32, "First stage width; subsequent encoder stages double it."),
+        kernel_size=POS(3, "Positive odd depthwise kernel size."),
+        block_counts=SEQ((2, 2, 2, 2, 2, 2, 2, 2, 2), 9, "Blocks at four encoder stages, bottleneck, and four decoder stages."),
+        deep_supervision=BOOL(False, "Use four auxiliary prediction heads during training."),
+    ),
+    "efficientvit_seg": dict(
+        **PRETRAINED,
+        variant=CHOICE("b0", ("b0", "b1", "b2", "b3"), "MIT EfficientViT encoder size."),
+        decoder_channels={**POS(None, "Segmentation head width; None uses the variant preset."), "nullable": True},
+        decoder_depth={**POS(None, "Number of residual MBConv head blocks; None uses the variant preset."), "nullable": True},
+        dropout={**DROP, "default": 0.0},
+    ),
     "transunet": dict(
         preset=CHOICE("standard", ("lightweight", "standard", "heavy", None), "CNN/transformer size preset."),
         encoder_name=CHOICE("custom", ("custom", "resnet50"), "CNN encoder."),
@@ -188,11 +208,13 @@ def normalize_model_options(
         raise ModelError("image_size is too small for num_decoder_blocks.")
     if name == "double_unet" and (in_channels != 3 or num_classes != 1 or any(n % 16 for n in size)):
         raise ModelError("DoubleUNet requires RGB binary segmentation and dimensions divisible by 16.")
-    if name in ("deit", "swin_unet", "pvt_unet", "swin_unet_full", "pvtformer_full") and in_channels not in (
+    if name in ("deit", "swin_unet", "pvt_unet", "swin_unet_full", "pvtformer_full", "dinov3_seg", "efficientvit_seg") and in_channels not in (
         1,
         3,
     ):
         raise ModelError(f"{name} supports only 1 or 3 input channels.")
+    if name == "mednext_2d" and effective["kernel_size"] % 2 == 0:
+        raise ModelError("MedNeXt kernel_size must be odd.")
     if name == "segformer":
         stage = {
             k: ((v,) * 4 if isinstance(v, int) else v) for k, v in effective.items() if k != "decoder_dim"

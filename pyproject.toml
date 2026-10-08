@@ -40,5 +40,8 @@ transformers = ["timm>=1.0.25,<2"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"bicbioseg.models" = ["licenses/*.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
