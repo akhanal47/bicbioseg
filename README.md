@@ -177,3 +177,7 @@ Select per-image or dataset-wide aggregation in the [evaluation guide](docs/eval
 - [Read acknowledgments](docs/references.md)
 
 The project uses the [MIT license](LICENSE).
+
+## Planned Upgrades
+- SAM Inference (in 0.4.0)
+- SAM Finetuning (no ETA)
