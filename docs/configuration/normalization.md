@@ -46,6 +46,8 @@ The default uint8 path resizes before scaling. Explicit intensity policies scale
 ResNet-50 TransUNet and all timm models apply ImageNet normalization internally by default.
 This applies even with random encoder weights. Grayscale repeats to RGB for these encoders.
 Custom TransUNet defaults to no internal normalization. Other local models do not add this ImageNet step.
+IS-Net can subtract 0.5 with `model_kwargs={"normalize_input": True}`.
+Enable this option when you load upstream DIS weights. It is off by default.
 
 Do not apply ImageNet normalization again to inputs from the package loader.
 For already-normalized tensors supplied directly to a supported model, set `model_kwargs={"normalize_input": False}`.

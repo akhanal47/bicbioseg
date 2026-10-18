@@ -13,8 +13,9 @@ The project acknowledges these model and implementation references:
 - [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3): DINOv3 encoder features, paired here with a trainable bicbioseg decoder.
 - [MIC-DKFZ/MedNeXt](https://github.com/MIC-DKFZ/MedNeXt): MedNeXt v1 blocks and encoder-decoder, adapted for 2D segmentation.
 - [mit-han-lab/efficientvit](https://github.com/mit-han-lab/efficientvit): EfficientViT B-series encoder and lightweight segmentation head.
+- [xuebinqin/DIS](https://github.com/xuebinqin/DIS): IS-Net DIS from *Highly Accurate Dichotomous Image Segmentation* (Qin et al., ECCV 2022).
 
-MedNeXt and EfficientViT source adaptations retain their [Apache-2.0 license](../src/bicbioseg/models/licenses/Apache-2.0.txt)
+MedNeXt, EfficientViT, and IS-Net source adaptations retain their [Apache-2.0 license](../src/bicbioseg/models/licenses/Apache-2.0.txt)
 and [attribution notices](../src/bicbioseg/models/licenses/NOTICE.txt).
 DINOv3 pretrained weights retain the upstream [DINOv3 license](https://github.com/facebookresearch/dinov3/blob/main/LICENSE.md).
 

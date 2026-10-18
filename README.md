@@ -102,11 +102,12 @@ See the [component diagram and user guide](docs/README.md).
 
 ## Choose a model
 
-The library provides 15 architectures. Each link lists its variants, defaults, input requirements, and configuration example.
+The library provides 16 architectures. Each link lists its variants, defaults, input requirements, and configuration example.
 
 | Model | Main choices |
 | --- | --- |
 | [U-Net](docs/models/unet.md) | Width, depth, and upsampling method |
+| [IS-Net](docs/models/isnet.md) | Full DIS segmentation network, with optional five-head deep supervision and upstream weight loading |
 | [CAttention U-Net](docs/models/cattention_unet.md) | U-Net with decoder channel and spatial attention |
 | [DoubleUNet](docs/models/double_unet.md) | VGG19, ResNet-50, or ResNet-101 first encoder. RGB binary masks only. |
 | [TransUNet](docs/models/transunet.md) | Custom CNN or ResNet-50, with lightweight, standard, and heavy transformer configurations |

@@ -2,7 +2,7 @@
 
 [Main guide](../../README.md) · [Documentation](../README.md)
 
-All 15 architectures use the same training, evaluation, and prediction API.
+All 16 architectures use the same training, evaluation, and prediction API.
 An encoder extracts image features. A decoder converts those features into a mask.
 A skip connection passes spatial detail from the encoder to the decoder.
 
@@ -12,6 +12,7 @@ Put architecture-specific options in `model_kwargs`.
 | Model | Encoder choices | Decoder | Optional installation |
 | --- | --- | --- | --- |
 | [`unet`](unet.md) | Configurable CNN | Convolutions and skips | None |
+| [`isnet`](isnet.md) | Six residual U-block stages | Five residual U-block stages with skips and six side heads | None |
 | [`cattention_unet`](cattention_unet.md) | Configurable CNN | Convolutions, skips, and CBAM | None |
 | [`double_unet`](double_unet.md) | VGG19, ResNet-50, ResNet-101 | Two cascaded U-Nets | None |
 | [`transunet`](transunet.md) | Custom CNN or ResNet-50, then local transformer | Convolutions and 0–3 skips | None |
@@ -72,12 +73,15 @@ You can pass `(images, masks)` as `sample_batch` and select `precision`.
 ## Weights and outputs
 
 All models expose logits to `Segmenter`. The loss and prediction methods apply the required activations.
-Pretrained options initialize encoders only. No pretrained segmentation decoder is supplied.
+Automatic pretrained options initialize encoders only.
+IS-Net also accepts manually downloaded upstream segmentation weights through `load_weights`.
+See [IS-Net weight loading](isnet.md#load-upstream-weights) for the required settings.
 Requested pretrained weights can require network access.
 
 Full Swin-Unet, PVTFormer, ResUNet++, and UNeXt support `deep_supervision=True`.
 These models add two auxiliary heads during training. Inference uses only the main prediction.
 MedNeXt in 2D also supports deep supervision, with four auxiliary heads during training.
+IS-Net supports five auxiliary heads. Its separate ground-truth feature supervision is not included.
 See [auxiliary loss weights](../configuration/training.md).
 
 Use [`Segmenter.save()` and `Segmenter.load()`](../training.md) to retain the model configuration.

@@ -30,6 +30,10 @@ PVT = CHOICE("b0", tuple(f"b{i}" for i in range(6)), "PVTv2 encoder size.")
 DEEP = BOOL(False, "Use two auxiliary prediction heads during training.")
 MODEL_OPTIONS = {
     "unet": CNN,
+    "isnet": dict(
+        deep_supervision=BOOL(False, "Use five auxiliary side predictions during training; no ground-truth feature supervision."),
+        normalize_input=BOOL(False, "Subtract 0.5 from [0, 1] inputs; enable for upstream pretrained DIS weights."),
+    ),
     "cattention_unet": deepcopy(CNN),
     "double_unet": dict(
         backbone=CHOICE("vgg19", ("vgg19", "resnet50", "resnet101"), "First encoder backbone."),
