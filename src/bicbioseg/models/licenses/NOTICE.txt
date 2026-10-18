@@ -10,6 +10,17 @@ EfficientViT segmentation head (efficientvit_seg.py)
 https://github.com/mit-han-lab/efficientvit
 Copyright 2023 Han Cai.
 
+IS-Net DIS segmentation network (isnet.py)
+https://github.com/xuebinqin/DIS
+Xuebin Qin, Hang Dai, Xiaobin Hu, Deng-Ping Fan, Ling Shao, and Luc Van Gool.
+Highly Accurate Dichotomous Image Segmentation, ECCV 2022.
+Source: IS-Net/models/isnet.py at b6764e20381f6f42a70f83fa3324181529ed1403.
+The upstream README licenses the code and evaluation metric under Apache-2.0.
+Changes: shared RSU blocks, input validation, optional input centering, and
+raw logits with bicbioseg auxiliary outputs. The separate ground-truth encoder
+and intermediate feature supervision training procedure are not included.
+No pretrained checkpoints or DIS5K dataset files are distributed here.
+
 DINOv3 and EfficientViT encoders are loaded through the optional timm dependency.
 Pretrained encoder checkpoints are not distributed with bicbioseg. DINOv3
 checkpoints retain the DINOv3 license:
