@@ -16,6 +16,7 @@ class ModelSpec:
 
 MODEL_SPECS = {
     "unet": ModelSpec("unet", "UNet", "n_channels", "n_classes", "image_size", ("u-net",)),
+    "isnet": ModelSpec("isnet", "ISNetDIS", "in_channels", "n_classes", aliases=("is-net", "isnet_dis")),
     "cattention_unet": ModelSpec(
         "cattention_unet", "CAttentionUNet", "n_channels", "n_classes", "image_size",
         aliases=("cattunet", "cattention-u-net"),
@@ -42,6 +43,7 @@ def model_metadata(name):
 
     descriptions = {
         "unet": "Configurable convolutional U-Net with skip connections.",
+        "isnet": "IS-Net DIS with nested residual U-blocks and six side predictions; optional output deep supervision.",
         "cattention_unet": "Configurable CAttention U-Net with CBAM after skip concatenation in each decoder stage.",
         "double_unet": "Cascaded U-Nets with a torchvision encoder and ASPP.",
         "transunet": "CNN/ViT hybrid encoder with a convolutional skip decoder.",
@@ -71,6 +73,7 @@ def model_metadata(name):
     }
     constraints = {
         "unet": "Spatial dimensions must accommodate 2**num_decoder_blocks downsampling.",
+        "isnet": "Positive channel count and spatial dimensions; training BatchNorm requires batch * ceil(H/64) * ceil(W/64) > 1.",
         "cattention_unet": "Spatial dimensions >=2**num_decoder_blocks; training BatchNorm needs multiple values per channel.",
         "double_unet": "RGB binary segmentation only; dimensions divisible by 16, >=32 recommended.",
         "transunet": "Dimensions divisible by 16; ResNet encoder accepts 1 or 3 channels.",
@@ -91,7 +94,7 @@ def model_metadata(name):
             if name == "transunet"
             else ("variant" if transformer or name in {"unext_full", "mednext_2d"} else None)
         ),
-        "dependencies": ["torch", "timm>=1.0.25,<2"] if transformer else (["torch"] if name == "mednext_2d" else ["torch", "torchvision", "einops"]),
+        "dependencies": ["torch", "timm>=1.0.25,<2"] if transformer else (["torch"] if name in {"mednext_2d", "isnet"} else ["torch", "torchvision", "einops"]),
         "install_extra": "bicbioseg[transformers]" if transformer else None,
         "supported_devices": ["cpu", "cuda", "mps"],
         "device_notes": "Requires an available PyTorch backend; run validate_setup on the target device.",
@@ -103,8 +106,10 @@ def model_metadata(name):
             else constraints[name]
         ),
         "deep_supervision": name
-        in {"swin_unet_full", "pvtformer_full", "resunetplusplus_full", "unext_full", "mednext_2d"},
+        in {"swin_unet_full", "pvtformer_full", "resunetplusplus_full", "unext_full", "mednext_2d", "isnet"},
         "pretrained": (
+            "Manual upstream ISNetDIS state dict via load_weights; requires RGB binary configuration and normalize_input=True. No automatic download."
+            if name == "isnet" else
             "DINOv3 LVD-1689M encoder via pretrained=True; decoder starts from scratch. Weights retain the DINOv3 license."
             if name == "dinov3_seg" else
             "ImageNet encoder only via pretrained=True; decoder starts from scratch."

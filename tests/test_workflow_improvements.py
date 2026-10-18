@@ -60,6 +60,7 @@ def dataset(root, count=3):
 
 
 SMALL = {
+    "isnet": {},
     "unet": {"base_channels": 2, "num_decoder_blocks": 2},
     "cattention_unet": {"base_channels": 2, "num_decoder_blocks": 2},
     "double_unet": {"backbone": "resnet50", "pretrained": False},

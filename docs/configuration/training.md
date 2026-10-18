@@ -80,6 +80,7 @@ Other scheduler arguments pass to `StepLR`, `CosineAnnealingLR`, or `ReduceLROnP
 Set `model_kwargs={"deep_supervision": True}` on a supported model.
 Full Swin-Unet, PVTFormer, ResUNet++, and UNeXt each add two auxiliary heads.
 Use `aux_loss_weights=(0.4, 0.2)`, for example. The total is the main loss plus each weighted auxiliary loss.
+MedNeXt requires four weights. IS-Net requires five weights, in `side2` through `side6` order.
 When weights are omitted, each auxiliary head receives weight 0.4. Inference uses the main head only.
 
 ## Resume a run
