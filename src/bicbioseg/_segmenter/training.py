@@ -408,7 +408,6 @@ def train(
                 best_value = current_value
                 stale_epochs = 0
                 if run_dir is not None and save_best:
-                    best_value = current_value
                     self.save(run_dir / "best_model.pt", optimizer=optimizer_obj)
             else:
                 stale_epochs += 1

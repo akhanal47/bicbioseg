@@ -139,6 +139,23 @@ Folder batches can contain different source image sizes. Duplicate source stems 
 Ensemble prediction also accepts `batch_size`, `return_arrays`, `save_probability`, and `structured`.
 Ensemble class counts and saved class maps must match.
 
+## Resolve input and output errors
+
+Folder prediction reads files directly inside the selected folder.
+It does not read subfolders.
+Use PNG, JPEG, BMP, or TIFF files. Filename extensions can use upper or lower case.
+An empty folder or image list causes an `InferenceError` before output files are created.
+Each source image must have a unique filename stem.
+For example, `cell.png` and `cell.tif` cannot be in the same prediction request.
+
+If an image output cannot be saved, prediction stops with an `InferenceError`.
+The error message gives the output path.
+Check write access and available disk space before you run prediction again.
+Files saved before the error can remain in the output folder.
+Use a new output folder for each run to keep previous results separate.
+
+## Read structured results
+
 Set `structured=True` on any prediction method for the shared record format:
 
 | Field | Contents |

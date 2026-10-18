@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import vgg19, resnet50, resnet101, efficientnet_b0
+from torchvision.models import vgg19, resnet50, resnet101, VGG19_Weights, ResNet50_Weights, ResNet101_Weights
 
 class Conv2D(nn.Module):
     def __init__(self, in_c, out_c, kernel_size=3, padding=1, dilation=1, bias=False, act=True):
@@ -96,15 +96,18 @@ class BackboneEncoder(nn.Module):
     SUPPORTED_BACKBONES = {
         'vgg19': {
             'channels': [64, 128, 256, 512, 512],
-            'model_fn': vgg19
+            'model_fn': vgg19,
+            'weights': VGG19_Weights.IMAGENET1K_V1
         },
         'resnet50': {
             'channels': [64, 256, 512, 1024, 2048],
-            'model_fn': resnet50
+            'model_fn': resnet50,
+            'weights': ResNet50_Weights.IMAGENET1K_V1
         },
         'resnet101': {
             'channels': [64, 256, 512, 1024, 2048],
-            'model_fn': resnet101
+            'model_fn': resnet101,
+            'weights': ResNet101_Weights.IMAGENET1K_V1
         }
     }
 
@@ -120,24 +123,24 @@ class BackboneEncoder(nn.Module):
         self.backbone_name = backbone
         self.channels = self.SUPPORTED_BACKBONES[backbone]['channels']
         model_fn = self.SUPPORTED_BACKBONES[backbone]['model_fn']
+        # Use the same weights as the previous pretrained=True option.
+        weights = self.SUPPORTED_BACKBONES[backbone]['weights'] if pretrained else None
         
         if backbone.startswith('vgg'):
-            self._init_vgg(model_fn, pretrained)
+            self._init_vgg(model_fn, weights)
         elif backbone.startswith('resnet'):
-            self._init_resnet(model_fn, pretrained)
-        elif backbone.startswith('efficientnet'):
-            self._init_efficientnet(model_fn, pretrained)
+            self._init_resnet(model_fn, weights)
     
-    def _init_vgg(self, model_fn, pretrained):
-        network = model_fn(pretrained=pretrained)
+    def _init_vgg(self, model_fn, weights):
+        network = model_fn(weights=weights)
         self.x1 = network.features[:4]
         self.x2 = network.features[4:9]
         self.x3 = network.features[9:18]
         self.x4 = network.features[18:27]
         self.x5 = network.features[27:36]
     
-    def _init_resnet(self, model_fn, pretrained):
-        network = model_fn(pretrained=pretrained)        
+    def _init_resnet(self, model_fn, weights):
+        network = model_fn(weights=weights)
         network.conv1.stride = (1, 1)
         self.x1 = nn.Sequential(network.conv1, network.bn1, network.relu)
         self.x2 = nn.Sequential(network.maxpool, network.layer1)

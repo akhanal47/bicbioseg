@@ -51,6 +51,10 @@ ASPP combines features at different dilation rates. Both decoders use encoder sk
 
 The public options do not include decoder widths, encoder freezing, internal ImageNet normalization, or deep supervision. Request pretrained weights explicitly if you need them. This can download weights.
 
+`pretrained=True` selects the torchvision `IMAGENET1K_V1` weights for the first encoder.
+`pretrained=False` starts the encoder with random weights.
+Loading a full checkpoint does not download encoder weights.
+
 `model.model.get_architecture_info()` reports the backbone and parameter counts.
 
 ## Direct PyTorch use

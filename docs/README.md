@@ -15,6 +15,7 @@ Follow the workflow or open the reference for the setting you need.
 | Score predictions and inspect failures | [Evaluation](evaluation.md) |
 | Compare model and loss combinations | [Experiments](experiments.md) |
 | Find defaults and accepted values | [Configuration reference](configuration/README.md) |
+| Test a change or report a problem | [Development checks](development.md) |
 | Find implementation references | [Acknowledgments](references.md) |
 
 ## Library components

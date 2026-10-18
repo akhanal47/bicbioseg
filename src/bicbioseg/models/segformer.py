@@ -1,10 +1,8 @@
-from math import sqrt
 from functools import partial
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
-from einops import rearrange, reduce
-from einops.layers.torch import Rearrange
+from einops import rearrange
 
 
 def cast_tuple(val, depth):
