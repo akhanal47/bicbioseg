@@ -1,5 +1,3 @@
-import torch
-
 def precision(y_true, y_pred):
     intersection = (y_true * y_pred).sum()
     return (intersection + 1e-15) / (y_pred.sum() + 1e-15)

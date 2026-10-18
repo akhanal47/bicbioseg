@@ -65,7 +65,6 @@ def save(self, path: Union[str, os.PathLike], optimizer=None) -> str:
     }
     if optimizer is not None:
         checkpoint["optimizer_state_dict"] = optimizer.state_dict()
-    if optimizer is not None:
         checkpoint["optimizer_name"] = optimizer.__class__.__name__.lower()
         checkpoint["training_options"] = self._training_options
         checkpoint["scheduler_state_dict"] = self._scheduler.state_dict() if self._scheduler is not None else None
@@ -85,7 +84,7 @@ def save(self, path: Union[str, os.PathLike], optimizer=None) -> str:
 
 
 def load_weights(self, path: Union[str, os.PathLike]):
-    checkpoint = read_checkpoint(path, map_location=self.device)
+    checkpoint = read_checkpoint(path, map_location="cpu")
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     self.model.load_state_dict(state_dict)
     self.history = checkpoint.get("history", self.history)
@@ -99,7 +98,8 @@ def load(
     loss: Optional[Union[str, torch.nn.Module, Callable]] = None,
     **overrides,
 ):
-    checkpoint = read_checkpoint(path, map_location=cls.resolve_device(device))
+    # Keep unused optimizer state off the accelerator during model loading.
+    checkpoint = read_checkpoint(path, map_location="cpu")
     saved_image_size = checkpoint.get("image_size", (224, 224))
     if isinstance(saved_image_size, list):
         saved_image_size = tuple(saved_image_size)
@@ -123,9 +123,8 @@ def load(
     }
     config.update(overrides)
 
-    # Initialization weights are redundant when restoring the full state.
-    # Preserve the saved configuration as provenance, but never download
-    # encoder weights merely to overwrite them from this checkpoint.
+    # Keep the saved settings for reports.
+    # Load weights from the checkpoint without an encoder download.
     saved_model_kwargs = dict(config["model_kwargs"])
     restore_kwargs = dict(saved_model_kwargs)
     architecture = config["architecture"].lower()

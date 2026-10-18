@@ -9,10 +9,14 @@ import torch
 from ..exceptions import InferenceError
 from ..utils.preprocessing import image_tensor, normalize_image, read_rgb
 from ..utils.progress import progress_iter
+from .artifacts import _write_prediction_image
 
 
 def _load_inference_images(self, images) -> List[str]:
-    return self._load_paths_static(images)
+    paths = self._load_paths_static(images)
+    if not paths:
+        raise InferenceError("No images found. Provide image files or a folder that contains images.")
+    return paths
 
 
 def _predict_array(self, rgb: np.ndarray, threshold: float = 0.5, return_raw: bool = False):
@@ -149,20 +153,18 @@ def predict_one(
     show: bool = False,
     structured: bool = False,
 ):
-    self.model.eval()
-    with torch.no_grad():
-        rgb, pred, probability, logits = self._predict_single_image(
-            image, threshold=threshold, return_raw=True
-        )
+    rgb, pred, probability, logits = self._predict_single_image(
+        image, threshold=threshold, return_raw=True
+    )
 
     paths = {}
-    overlay = self._overlay_mask_on_image(rgb, pred)
+    overlay = self._overlay_mask_on_image(rgb, pred) if save_to is not None or return_overlay or show else None
     if save_to is not None:
         save_path = Path(save_to)
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(save_path), pred)
+        _write_prediction_image(save_path, pred)
         overlay_path = save_path.with_name(f"{save_path.stem}_overlay.png")
-        cv2.imwrite(str(overlay_path), cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+        _write_prediction_image(overlay_path, cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 
         paths = {"mask": str(save_path.resolve()), "overlay": str(overlay_path.resolve())}
     record = self._prediction_record(image, paths, threshold, pred, probability, logits, True)
@@ -299,8 +301,7 @@ def inference_large_image(
     if x_starts[-1] != max(0, width - patch_w):
         x_starts.append(max(0, width - patch_w))
 
-    # Normalize once over the source image, including percentile policies, so
-    # overlap pixels have identical intensities in every tile.
+    # Normalize the full image once to keep shared pixels equal in all tiles.
     normalized = rgb if self.normalization["mode"] == "standard" else normalize_image(rgb, self.normalization)
     weights = np.ones((patch_h, patch_w), dtype=np.float32)
     if weighting == "gaussian":
@@ -335,7 +336,7 @@ def inference_large_image(
     output_dir = Path(save_to)
     output_dir.mkdir(parents=True, exist_ok=True)
     mask_path = output_dir / f"{image_path.stem}_mask.png"
-    cv2.imwrite(str(mask_path), prediction)
+    _write_prediction_image(mask_path, prediction)
 
     outputs = {"mask": str(mask_path.resolve())}
     if save_probability:
@@ -345,7 +346,7 @@ def inference_large_image(
     if save_overlay:
         overlay = self._overlay_mask_on_image(rgb, prediction)
         overlay_path = output_dir / f"{image_path.stem}_overlay.png"
-        cv2.imwrite(str(overlay_path), cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+        _write_prediction_image(overlay_path, cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
         outputs["overlay"] = str(overlay_path.resolve())
 
     record = self._prediction_record(

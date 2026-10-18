@@ -48,12 +48,14 @@ def normalize_image(image, normalization=None):
 
 def image_tensor(image, image_size, in_channels=3, normalization=None):
     policy = validate_normalization(normalization)
-    # Preserve legacy uint8 resize rounding under the default policy. Explicit
-    # high-bit-depth policies normalize first to avoid integer interpolation.
+    # keep uint8 resize rounding with the standard policy.
+    # apply other normalization policies before resize to keep float precision.
     if policy["mode"] != "standard":
         image = normalize_image(image, policy)
     height, width = image_size
-    image = cv2.resize(np.asarray(image), (width, height), interpolation=cv2.INTER_LINEAR)
+    image = np.asarray(image)
+    if image.shape[:2] != (height, width):
+        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
     image = normalize_image(image)
     if image.ndim == 2:
         image = image[..., None]

@@ -1,7 +1,6 @@
 import csv
 import json
 import glob
-import os
 import re
 import shutil
 import warnings

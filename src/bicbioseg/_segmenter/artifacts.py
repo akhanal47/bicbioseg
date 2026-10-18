@@ -79,6 +79,15 @@ def _load_paths_static(paths_or_dir) -> List[str]:
     raise InferenceError(f"Could not find image source: {paths_or_dir}")
 
 
+def _write_prediction_image(path, image):
+    try:
+        saved = cv2.imwrite(str(path), image)
+    except cv2.error as exc:
+        raise InferenceError(f"Could not save prediction image: {path}. {exc}") from exc
+    if not saved:
+        raise InferenceError(f"Could not save prediction image: {path}.")
+
+
 def _save_contours(prediction: np.ndarray, path: Path):
     mask = prediction
     if mask.ndim == 3:
@@ -88,7 +97,7 @@ def _save_contours(prediction: np.ndarray, path: Path):
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     canvas = np.zeros_like(mask, dtype=np.uint8)
     cv2.drawContours(canvas, contours, -1, 255, 1)
-    cv2.imwrite(str(path), canvas)
+    _write_prediction_image(path, canvas)
 
 
 def _save_prediction_manifest(path, records):
@@ -123,14 +132,14 @@ def _save_prediction_files(
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(source).stem
     mask_path = output_dir / f"{stem}_mask.png"
-    cv2.imwrite(str(mask_path), prediction)
+    _write_prediction_image(mask_path, prediction)
     paths = {"mask": str(mask_path.resolve())}
     if save_overlay:
         directory = output_dir / "overlays"
         directory.mkdir(exist_ok=True)
         path = directory / f"{stem}_overlay.png"
         overlay = self._overlay_mask_on_image(rgb, prediction)
-        cv2.imwrite(str(path), cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+        _write_prediction_image(path, cv2.cvtColor((overlay * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
         paths["overlay"] = str(path.resolve())
     for enabled, kind, array in [
         (save_probability, "probability", probability),
